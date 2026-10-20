@@ -1,0 +1,52 @@
+Rahul Kumar
+Seeking: Masters / PhD in Artificial Intelligence or Computer Science
+Target Countries: Germany, Netherlands, Canada
+English Proficiency: IELTS Overall 7.5 (Reading 8.0, Listening 8.0, Writing 6.5, Speaking 7.0)
+Funding Required: Yes
+
+EDUCATION
+---------
+Bachelor of Technology — Computer Science & Engineering
+Indian Institute of Technology (IIT) Delhi
+CGPA: 8.7 / 10.0 | Expected Graduation: May 2025
+
+SKILLS
+------
+Programming: Python, C++, Java, MATLAB
+ML/AI Frameworks: PyTorch, TensorFlow, Scikit-learn, Hugging Face Transformers
+Tools: Git, Docker, Linux, LaTeX, Jupyter
+
+PROJECTS
+--------
+1. Neural Architecture Search for Medical Imaging (B.Tech Thesis)
+   - Designed a differentiable NAS framework to optimize CNN architectures for MRI segmentation
+   - Achieved 3.2% improvement in Dice score over baseline U-Net on BraTS 2023 dataset
+   - Technologies: PyTorch, MONAI, CUDA
+
+2. Multilingual Sentiment Analysis (Course Project)
+   - Fine-tuned multilingual BERT on 5 languages; achieved 91.3% accuracy on test set
+   - Technologies: Hugging Face Transformers, Python
+
+3. Real-time Object Detection on Edge Devices
+   - Optimized YOLOv8 for Raspberry Pi deployment using INT8 quantization
+   - Reduced inference latency by 40% with <1% mAP loss
+   - Technologies: PyTorch, ONNX Runtime, TensorFlow Lite
+
+EXPERIENCE
+----------
+Research Intern — IIT Delhi AI Lab (Summer 2024)
+- Contributed to a federated learning project on privacy-preserving medical data
+- Co-authored a paper submitted to NeurIPS 2024 Workshop
+
+ACHIEVEMENTS
+------------
+- All India Rank 847 in JEE Advanced 2021 (out of 150,000 candidates)
+- Best Project Award, IIT Delhi CSE Department, 2024
+- Qualified for ICPC Regional 2023
+
+PREFERENCES
+-----------
+Preferred Programs: MSc Computer Science, MSc Artificial Intelligence, MSc Data Science
+Open to: Research-track programs, TA/RA positions
+Funding: Scholarship or stipend required
+Start Date: September / October 2025 or 2026
