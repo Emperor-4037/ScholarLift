@@ -224,6 +224,9 @@ def make_graph(
     async def run_graph(initial_state: SwarmState, event_bus: EventBus, **kwargs) -> SwarmState:
         """Execute the compiled graph from initial_state."""
         result = await graph.ainvoke(initial_state)
+        # LangGraph returns a dict when nodes return Pydantic models; reconstruct
+        if isinstance(result, dict):
+            return SwarmState(**result)
         return result
 
     return run_graph

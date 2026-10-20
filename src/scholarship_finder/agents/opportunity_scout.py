@@ -214,7 +214,8 @@ class OpportunityScoutAgent:
                     text=str(q.get("text", "")),
                     intent=str(q.get("intent", "program")),
                     country=q.get("country"),
-                    domain_filters={"include": [], "exclude": []},
+                    include_domains=[],
+                    exclude_domains=[],
                     depth=str(q.get("depth", "basic")),
                     round_number=round_number,
                 ))
@@ -267,8 +268,8 @@ class OpportunityScoutAgent:
             country=query.country,
             max_results=10,
             depth=query.depth,
-            include_domains=query.domain_filters.get("include", []) if query.domain_filters else [],
-            exclude_domains=query.domain_filters.get("exclude", []) if query.domain_filters else [],
+            include_domains=query.include_domains if query.include_domains else [],
+            exclude_domains=query.exclude_domains if query.exclude_domains else [],
         )
         result = await active_port.search(sq)
         return [
@@ -361,7 +362,8 @@ def _fallback_queries(profile: Any, round_number: int) -> list[SearchQuery]:
             text=f"{level} {field} scholarship {country} funded",
             intent="scholarship",
             country=country,
-            domain_filters={"include": [], "exclude": []},
+            include_domains=[],
+            exclude_domains=[],
             depth="advanced",
             round_number=round_number,
         ),
@@ -370,7 +372,8 @@ def _fallback_queries(profile: Any, round_number: int) -> list[SearchQuery]:
             text=f"{level} program {field} {country} admissions",
             intent="program",
             country=country,
-            domain_filters={"include": [], "exclude": []},
+            include_domains=[],
+            exclude_domains=[],
             depth="basic",
             round_number=round_number,
         ),

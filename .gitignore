@@ -36,3 +36,11 @@ htmlcov/
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+.projectmem/events.jsonl
+.projectmem/watch.pid
+.projectmem/watch.log
+.projectmem/structure.json
+
+.codegraph/
+.projectmem/

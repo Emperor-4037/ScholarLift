@@ -52,4 +52,12 @@ Deviations from `architecture_report_autonomous_multi_agent_ai_scholarship_finde
 **Change:** Canary logic in its own module, runnable as `python -m scholarship_finder.preflight` or imported into the Streamlit sidebar.
 **Rationale:** Keeps the UI layer thin; the pre-flight logic can evolve independently. Also allows CI to run the canary without launching Streamlit.
 
+## DEC-IMPL-013: Shared EventBus and per-run graph runner injection in RunGateway
+**Change:** `start_run()` accepts optional `graph_runner` and `bus` arguments.
+**Rationale:** Prevents race conditions when concurrent runs occur and ensures events emitted by the graph runner are published to the exact `EventBus` that the UI subscribes to.
+
+## DEC-IMPL-014: `nest_asyncio` integration for Streamlit event loop
+**Change:** Applied `nest_asyncio` in `scholarship_finder.ui.app`.
+**Rationale:** Streamlit executes in an event loop environment; nested event-loop patching allows `asyncio.get_event_loop().run_until_complete()` calls during intake without raising `RuntimeError: This event loop is already running`.
+
 

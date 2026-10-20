@@ -61,7 +61,7 @@ of study, on a scale of 0.0 to 1.0.
 
 Return ONLY valid JSON array (no markdown):
 [
-  {"opportunity_id": "<id>", "field_alignment": <float 0.0-1.0>, "rationale": "<1 sentence>"},
+  {{"opportunity_id": "<id>", "field_alignment": <float 0.0-1.0>, "rationale": "<1 sentence>"}},
   ...
 ]
 

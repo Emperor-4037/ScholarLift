@@ -229,6 +229,9 @@ class RunGateway:
                 runner(handle.state, handle.bus, is_replay=is_replay),
                 timeout=deadlines.phase_a_hard_s + deadlines.phase_b_cap_s,
             )
+            # LangGraph may return a dict — reconstruct SwarmState
+            if isinstance(updated_state, dict):
+                updated_state = SwarmState(**updated_state)
             # Update state in place
             handle.state = updated_state
             logger.info("RunGateway: run %s completed normally", run_id)

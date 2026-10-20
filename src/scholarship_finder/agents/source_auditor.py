@@ -68,7 +68,7 @@ For each page, extract the following fields if present:
 
 Return ONLY valid JSON array (no markdown):
 [
-  {
+  {{
     "page_index": <int>,
     "name": "<string or null>",
     "institution_or_funder": "<string or null>",
@@ -78,13 +78,13 @@ Return ONLY valid JSON array (no markdown):
     "deadline": "<string or null>",
     "requirements": ["<string>", ...],
     "kind": "<string or null>",
-    "evidence_spans": {
+    "evidence_spans": {{
       "name": "<verbatim span from text, 15-400 chars or null>",
       "institution_or_funder": "<verbatim span or null>",
       "funding_level": "<verbatim span or null>",
       "deadline": "<verbatim span or null>"
-    }
-  },
+    }}
+  }},
   ...
 ]
 
