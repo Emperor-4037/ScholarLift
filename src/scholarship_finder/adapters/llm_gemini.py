@@ -235,8 +235,8 @@ class GeminiLLMAdapter:
                 models = self._settings.vision_models()
             else:
                 models = self._settings.fast_models()
-            model = models[0] if models else "gemini-2.0-flash"
-        model = model or "gemini-2.0-flash"
+            model = models[0] if models else "gemini-3.5-flash-lite"
+        model = model or "gemini-3.5-flash-lite"
         cache_key = f"{model}:{tier.value}"
         if cache_key not in self._adapters:
             self._adapters[cache_key] = GeminiAdapter(

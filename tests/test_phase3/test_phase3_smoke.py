@@ -185,7 +185,8 @@ class TestEventBus:
         assert bus.is_terminal()
 
     @pytest.mark.asyncio
-    async def test_wait_for_new_returns_immediately_if_events_exist(self):
+    async def test_since_returns_events_after_publish(self):
+        """since() returns events immediately after publish (thread-safe polling)."""
         bus = EventBus()
         await bus.publish(Event(
             run_id="r1", seq=0,
@@ -195,73 +196,78 @@ class TestEventBus:
             kind=EventKind.PROGRESS,
             payload={},
         ))
-        events = await bus.wait_for_new(cursor=0, timeout_s=0.1)
+        events = bus.since(cursor=0)
         assert len(events) == 1
 
 
 # ── RunGateway tests ──────────────────────────────────────────────────────────
 
 class TestRunGateway:
-    @pytest.mark.asyncio
-    async def test_start_run_returns_run_id(self):
+    def test_start_run_returns_run_id(self):
+        """start_run is now synchronous and returns immediately."""
         async def dummy_runner(state, bus, **kw):
             return state
 
         gw = RunGateway(graph_runner=dummy_runner, max_concurrent=3)
         state = _make_state()
-        run_id = await gw.start_run(state)
+        run_id = gw.start_run(state)
         assert run_id == state.run_meta.run_id
 
-    @pytest.mark.asyncio
-    async def test_subscribe_returns_run_started_event(self):
+    def test_subscribe_returns_run_started_event(self):
+        """RUN_STARTED is published synchronously (publish_sync) before thread."""
         async def dummy_runner(state, bus, **kw):
             return state
 
         gw = RunGateway(graph_runner=dummy_runner, max_concurrent=3)
         state = _make_state()
-        run_id = await gw.start_run(state)
-        await asyncio.sleep(0.05)  # let task fire
+        run_id = gw.start_run(state)
         events = gw.subscribe_events(run_id, cursor=0)
         kinds = [e.kind for e in events]
         assert EventKind.RUN_STARTED in kinds
 
-    @pytest.mark.asyncio
-    async def test_max_concurrent_runs_enforced(self):
-        # graph runner that blocks forever
+    def test_max_concurrent_runs_enforced(self):
+        """RuntimeError raised synchronously when cap is reached."""
+        import threading
+
+        started = threading.Event()
+
         async def blocking_runner(state, bus, **kw):
+            started.set()
             await asyncio.sleep(60)
             return state
 
         gw = RunGateway(graph_runner=blocking_runner, max_concurrent=1)
         state1 = _make_state()
         state2 = _make_state()
-        await gw.start_run(state1)
+        gw.start_run(state1)
+        started.wait(timeout=2.0)
         with pytest.raises(RuntimeError, match="Maximum concurrent runs"):
-            await gw.start_run(state2)
+            gw.start_run(state2)
 
-    @pytest.mark.asyncio
-    async def test_cancel_marks_run_finished(self):
-        event = asyncio.Event()
+    def test_cancel_marks_run_finished(self):
+        """cancel() is synchronous and marks handle.finished immediately."""
+        import threading
+
+        started = threading.Event()
 
         async def waiter(state, bus, **kw):
-            await event.wait()
+            started.set()
+            await asyncio.sleep(60)
             return state
 
         gw = RunGateway(graph_runner=waiter, max_concurrent=3)
         state = _make_state()
-        run_id = await gw.start_run(state)
-        await asyncio.sleep(0.05)
-
-        cancelled = await gw.cancel(run_id)
+        run_id = gw.start_run(state)
+        started.wait(timeout=2.0)
+        cancelled = gw.cancel(run_id)
         assert cancelled is True
         assert gw._runs[run_id].finished
 
-    @pytest.mark.asyncio
-    async def test_get_snapshot_returns_state(self):
+    def test_get_snapshot_returns_state(self):
         async def dummy(state, bus, **kw): return state
         gw = RunGateway(graph_runner=dummy, max_concurrent=3)
         state = _make_state()
-        run_id = await gw.start_run(state)
+        run_id = gw.start_run(state)
         snap = gw.get_snapshot(run_id)
         assert snap is not None
         assert snap.run_meta.run_id == run_id

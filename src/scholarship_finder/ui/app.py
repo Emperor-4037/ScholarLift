@@ -14,15 +14,10 @@ Architecture: thin UI layer — all intelligence is in the engine.
 """
 from __future__ import annotations
 
-import asyncio
-import io
 import logging
 import os
 import time
 from typing import Any
-
-import nest_asyncio
-nest_asyncio.apply()  # Allow asyncio.run() inside Streamlit's running event loop
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -146,6 +141,9 @@ def _render_preflight():
 
     checks = []
     checks.append(("GEMINI_API_KEY", bool(cfg.gemini_api_key or os.getenv("GEMINI_API_KEY"))))
+    groq_ok = bool(getattr(cfg, "groq_api_key", None) or getattr(cfg, "openai_api_key", None) or os.getenv("GROQ_API_KEY") or os.getenv("OPENAI_API_KEY"))
+    if groq_ok:
+        checks.append(("GROQ_API_KEY (failover)", True))
     checks.append(("TAVILY_API_KEY", bool(cfg.tavily_api_key or os.getenv("TAVILY_API_KEY"))))
     checks.append(("JINA_API_KEY", bool(cfg.jina_api_key or cfg.jina_reader_key or os.getenv("JINA_API_KEY") or os.getenv("JINA_READER_KEY"))))
     checks.append(("GITHUB_TOKEN", bool(cfg.github_token or os.getenv("GITHUB_TOKEN"))))
@@ -208,14 +206,18 @@ def _render_intake_form():
 
 
 def _start_run(uploaded_file, display_name: str, github_username: str):
-    """Launch a new run."""
+    """Launch a new run — fully synchronous, no asyncio.run needed in the UI.
+
+    Intake runs in a tiny temporary event loop (fast, < 1 s).
+    The heavy pipeline (search / LLM / fetch) starts in a background daemon
+    thread that keeps running independently across Streamlit reruns.
+    """
     gateway = _get_gateway()
 
     if st.session_state.replay_mode:
-        # Load bundled sample persona
         file_bytes = _load_replay_resume()
-        filename = "rahul_sample_resume.pdf"
-        mime_type = "application/pdf"
+        filename = "rahul_sample_resume.txt"
+        mime_type = "text/plain"
         display_name = display_name or "Rahul"
     else:
         file_bytes = uploaded_file.read()
@@ -227,9 +229,10 @@ def _start_run(uploaded_file, display_name: str, github_username: str):
             "md": "text/markdown",
         }.get(ext, "application/pdf")
 
-    async def _run():
+    try:
         from scholarship_finder.composition import start_run_with_intake
-        return await start_run_with_intake(
+        # start_run_with_intake is now fully synchronous
+        run_id = start_run_with_intake(
             gateway,
             file_bytes=file_bytes,
             filename=filename,
@@ -238,10 +241,6 @@ def _start_run(uploaded_file, display_name: str, github_username: str):
             github_username=github_username.strip() or None,
             is_replay=st.session_state.replay_mode,
         )
-
-    try:
-        loop = asyncio.get_event_loop()
-        run_id = loop.run_until_complete(_run())
         st.session_state.run_id = run_id
         st.session_state.event_cursor = 0
         st.session_state.events = []
@@ -481,7 +480,7 @@ def _render_checklist():
 # ── Progress indicator ────────────────────────────────────────────────────────
 
 def _render_progress():
-    """Show a spinner while the run is in progress."""
+    """Show a spinner while the background pipeline thread is running."""
     gateway = _get_gateway()
     run_id = st.session_state.run_id
     if not run_id:
@@ -495,15 +494,17 @@ def _render_progress():
         events = st.session_state.get("events", [])
         last_node = next(
             (e.node for e in reversed(events) if e.kind.value in ("node_started", "progress")),
-            "initializing"
+            "initializing",
         )
         st.info(f"⏳ Running… current step: **{last_node.replace('_', ' ').title()}**")
-        # Auto-refresh
-        time.sleep(0.5)
+        # Poll every 1.5 s — the background thread updates handle.finished and
+        # publishes events independently of Streamlit reruns.
+        time.sleep(1.5)
         st.rerun()
     else:
-        phase = handle.state.run_meta.phase.value
-        outcome = handle.state.run_meta.outcome.value
+        snap = handle.get_state()
+        phase = snap.run_meta.phase.value
+        outcome = snap.run_meta.outcome.value
         icon = {"COMPLETE": "✅", "DEGRADED": "⚠️", "PARTIAL": "🔶", "FAILED_SAFE": "❌"}.get(outcome, "✅")
         st.success(f"{icon} Run complete — outcome: **{outcome}** · phase: {phase}")
 

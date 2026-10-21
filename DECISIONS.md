@@ -61,3 +61,11 @@ Deviations from `architecture_report_autonomous_multi_agent_ai_scholarship_finde
 **Rationale:** Streamlit executes in an event loop environment; nested event-loop patching allows `asyncio.get_event_loop().run_until_complete()` calls during intake without raising `RuntimeError: This event loop is already running`.
 
 
+## DEC-IMPL-015: First-class Groq failover configuration and Gemini 3.5 tier chains
+**Change:** Added native support for `GROQ_API_KEY` in `Settings` with automatic `api.groq.com/openai/v1` default routing (retaining fallback to `OPENAI_API_KEY`). Updated active model chains to `gemini-3.5-flash-lite,gemini-flash-lite-latest` and `gemini-3.5-flash`, registered matching quota governor profiles, and expanded the pre-flight canary probe.
+**Rationale:** Eliminates misleading OpenAI naming when using Groq as the fast failover provider, aligns active models with modern Gemini 3.5 capabilities, and ensures accurate token-bucket rate governance.
+
+## DEC-IMPL-016: Dedicated background OS thread with isolated event loop per run
+**Change:** Replaced in-loop asyncio.Task scheduling in RunGateway with a dedicated daemon threading.Thread per run that hosts its own fresh asyncio.new_event_loop(). Converted EventBus to use threading.Lock instead of asyncio.Lock for cross-thread safety. Made start_run() and subscribe_events() fully synchronous and non-blocking.
+**Rationale:** In Streamlit, each page rerun causes the script runner's event loop to pause or reset. Background asyncio.Task instances attached to the script loop were starved of CPU cycles and remained frozen at 'Initializing'. Decoupling pipeline execution into an independent background OS thread guarantees steady progress regardless of UI polling frequency or page reruns.
+

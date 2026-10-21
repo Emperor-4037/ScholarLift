@@ -203,7 +203,16 @@ class OpenAILLMAdapter:
     def __init__(self, api_key: str, settings: Any = None) -> None:
         self._api_key = api_key
         self._settings = settings
-        base_url = (getattr(settings, "openai_api_base_url", "") or "").strip()
+        base_url = (
+            getattr(settings, "groq_api_base_url", "")
+            or getattr(settings, "openai_api_base_url", "")
+            or ""
+        ).strip()
+        if not base_url and (
+            getattr(settings, "groq_api_key", "")
+            or api_key.startswith("gsk_")
+        ):
+            base_url = "https://api.groq.com/openai/v1"
         self._base_url = base_url.rstrip("/") if base_url else ""
         self._adapters: dict[str, OpenAICompatAdapter] = {}
 

@@ -13,6 +13,7 @@ Streamlit app (it is async-safe and stateless between runs).
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from functools import lru_cache
 from typing import Any
@@ -119,7 +120,7 @@ def build_gateway(settings=None) -> RunGateway:
     return gateway
 
 
-async def start_run_with_intake(
+def start_run_with_intake(
     gateway: RunGateway,
     file_bytes: bytes,
     filename: str,
@@ -128,23 +129,34 @@ async def start_run_with_intake(
     github_username: str | None = None,
     is_replay: bool = False,
 ) -> str:
-    """Convenience coroutine: run intake → wire graph → start run. Returns run_id."""
-    from scholarship_finder.engine.gateway import make_initial_state
+    """Run intake synchronously then launch the graph in a background thread.
 
-    # Intake (PII scrub, PDF extract)
-    intake_result, vault = await gateway.intake_service.process(
-        file_bytes, filename, mime_type, display_name=display_name
-    )
+    **Fully synchronous** — safe to call directly from the Streamlit script
+    thread without ``asyncio.run`` or ``nest_asyncio``.
+
+    Intake (PDF extraction + PII scrubbing) is I/O-light and fast enough to
+    run synchronously in a tiny temporary event loop.  The heavy work
+    (search, fetch, LLM calls) runs in the background thread started by
+    ``RunGateway.start_run()``.
+    """
+    from scholarship_finder.engine.gateway import make_initial_state
+    from scholarship_finder.engine.event_bus import EventBus
+
+    # ── Intake: run async coroutine synchronously in a temp loop ──────────────
+    # This is safe because the Streamlit script thread does NOT have a running
+    # event loop — asyncio.run() creates a fresh one, runs to completion, and
+    # tears it down before returning.
+    async def _intake():
+        return await gateway.intake_service.process(
+            file_bytes, filename, mime_type, display_name=display_name
+        )
+
+    intake_result, vault = asyncio.run(_intake())
 
     initial_state = make_initial_state()
-    run_id = initial_state.run_meta.run_id
 
-    # Build a shared EventBus so the graph runner and gateway polling loop
-    # see the SAME events (fixes the two-bus bug).
-    from scholarship_finder.engine.event_bus import EventBus
+    # ── Build shared EventBus and per-run graph runner ─────────────────────────
     bus = EventBus()
-
-    # Build graph runner for this run (per-run, no global mutation)
     graph_runner = gateway.make_graph_runner(
         scrubbed_text=intake_result.scrubbed_text,
         github_username=github_username,
@@ -153,8 +165,8 @@ async def start_run_with_intake(
         is_replay=is_replay,
     )
 
-    # Pass bus and runner directly — no global _graph_runner mutation
-    return await gateway.start_run(
+    # ── Hand off to RunGateway (synchronous — launches background thread) ──────
+    return gateway.start_run(
         initial_state,
         is_replay=is_replay,
         graph_runner=graph_runner,
@@ -165,7 +177,7 @@ async def start_run_with_intake(
 # ── Internal adapter builders ─────────────────────────────────────────────────
 
 def _build_llm_port(cfg):
-    """Try Gemini first, fall back to OpenAI-compatible, then stub."""
+    """Try Gemini first, fall back to Groq/OpenAI-compatible, then stub."""
     gemini_key = getattr(cfg, "gemini_api_key", None)
     if gemini_key:
         try:
@@ -175,14 +187,14 @@ def _build_llm_port(cfg):
         except Exception as exc:
             logger.warning("Gemini adapter failed to init: %s", exc)
 
-    openai_key = getattr(cfg, "openai_api_key", None)
-    if openai_key:
+    failover_key = getattr(cfg, "groq_api_key", None) or getattr(cfg, "openai_api_key", None)
+    if failover_key:
         try:
             from scholarship_finder.adapters.llm_openai import OpenAILLMAdapter
-            logger.info("LLM: using OpenAI-compatible adapter")
-            return OpenAILLMAdapter(api_key=openai_key, settings=cfg)
+            logger.info("LLM: using Groq/OpenAI-compatible adapter")
+            return OpenAILLMAdapter(api_key=failover_key, settings=cfg)
         except Exception as exc:
-            logger.warning("OpenAI adapter failed to init: %s", exc)
+            logger.warning("Failover adapter (Groq/OpenAI) failed to init: %s", exc)
 
     logger.warning("LLM: no API keys configured — using stub (REPLAY/test only)")
     return _StubLLMPort()
@@ -260,9 +272,17 @@ def _build_profile_source(cfg):
 def _default_quota_profiles(cfg) -> list:
     from scholarship_finder.resilience.quota import QuotaProfile
     return [
+        QuotaProfile(provider="gemini", model="gemini-3.5-flash-lite", rpm=30, rpd=1500),
+        QuotaProfile(provider="gemini", model="gemini-3.5-flash", rpm=15, rpd=1500),
+        QuotaProfile(provider="gemini", model="gemini-flash-lite-latest", rpm=30, rpd=1500),
+        QuotaProfile(provider="gemini", model="gemini-flash-latest", rpm=15, rpd=1500),
         QuotaProfile(provider="gemini", model="gemini-2.0-flash-lite", rpm=30, rpd=1500),
         QuotaProfile(provider="gemini", model="gemini-2.0-flash", rpm=15, rpd=1500),
         QuotaProfile(provider="gemini", model="gemini-2.5-flash", rpm=10, rpd=500),
+        QuotaProfile(provider="groq", model="openai/gpt-oss-20b", rpm=30, rpd=1000),
+        QuotaProfile(provider="groq", model="openai/gpt-oss-120b", rpm=30, rpd=1000),
+        QuotaProfile(provider="openai_compat", model="openai/gpt-oss-20b", rpm=30, rpd=1000),
+        QuotaProfile(provider="openai_compat", model="openai/gpt-oss-120b", rpm=30, rpd=1000),
         QuotaProfile(provider="openai", model="gpt-4o-mini", rpm=60, rpd=3000),
         QuotaProfile(provider="tavily", model="search", rpm=100, rpd=5000),
     ]

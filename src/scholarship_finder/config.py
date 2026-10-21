@@ -48,13 +48,15 @@ class Settings(BaseSettings):
 
     # ── LLM ────────────────────────────────────────────────────────────────
     gemini_api_key: str = ""
+    groq_api_key: str = ""
+    groq_api_base_url: str = "https://api.groq.com/openai/v1"
     openai_api_base_url: str = ""
     openai_api_key: str = ""
 
     # Ordered comma-separated model IDs; first = highest preference
-    tier_fast_chain: str = "gemini-flash-lite-latest,gemini-2.5-flash"
-    tier_reasoning_chain: str = "gemini-2.5-flash"
-    tier_vision_chain: str = "gemini-2.5-flash"
+    tier_fast_chain: str = "gemini-3.5-flash-lite,gemini-flash-lite-latest"
+    tier_reasoning_chain: str = "gemini-3.5-flash"
+    tier_vision_chain: str = "gemini-3.5-flash"
 
     # Hard cap from DEC-1: ≤4 reasoning calls per run
     max_reasoning_calls_per_run: int = 4

@@ -59,6 +59,7 @@ async def run_preflight(settings=None) -> PreflightReport:
 
     checks = await asyncio.gather(
         _check_llm_gemini(cfg),
+        _check_llm_groq(cfg),
         _check_search_tavily(cfg),
         _check_search_jina(cfg),
         _check_fetch(cfg),
@@ -93,7 +94,7 @@ async def _check_llm_gemini(cfg) -> ProviderCheck:
                 tier=LLMTier.FAST,
                 instruction="Reply with the word PONG only.",
                 data_blocks=[],
-                max_output_tokens=10,
+                max_output_tokens=50,
             )),
             timeout=18.0,
         )
@@ -105,6 +106,36 @@ async def _check_llm_gemini(cfg) -> ProviderCheck:
         ms = (time.perf_counter() - t0) * 1000
         return ProviderCheck("LLM (Gemini)", ok=False,
                              detail=str(exc)[:80], latency_ms=ms)
+
+
+async def _check_llm_groq(cfg) -> ProviderCheck:
+    key = getattr(cfg, "groq_api_key", None) or getattr(cfg, "openai_api_key", None)
+    if not key:
+        return ProviderCheck("LLM Failover (Groq)", ok=False, detail="No GROQ_API_KEY set",
+                             warning="optional failover")
+    t0 = time.perf_counter()
+    try:
+        from scholarship_finder.adapters.llm_openai import OpenAILLMAdapter
+        from scholarship_finder.ports.llm import TaskSpec, LLMTier
+        adapter = OpenAILLMAdapter(api_key=key, settings=cfg)
+        result = await asyncio.wait_for(
+            adapter.complete(TaskSpec(
+                tier=LLMTier.FAST,
+                instruction="Reply with the word PONG only.",
+                data_blocks=[],
+                max_output_tokens=50,
+            )),
+            timeout=15.0,
+        )
+        ms = (time.perf_counter() - t0) * 1000
+        return ProviderCheck("LLM Failover (Groq)", ok=True,
+                             detail=f"model={result.model}",
+                             latency_ms=ms)
+    except Exception as exc:
+        ms = (time.perf_counter() - t0) * 1000
+        return ProviderCheck("LLM Failover (Groq)", ok=False,
+                             detail=str(exc)[:80], latency_ms=ms,
+                             warning="failover offline")
 
 
 async def _check_search_tavily(cfg) -> ProviderCheck:
