@@ -44,3 +44,7 @@ Desktop.ini
 
 .codegraph/
 .projectmem/
+
+# Architecture and requirements reports
+architecture_report_autonomous_multi_agent_ai_scholarship_finder.md
+software_architecture_and_requirements_report.md
