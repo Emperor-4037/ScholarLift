@@ -66,13 +66,6 @@ graph TB
     A5 -->|SOP Generation| LLM
     LLM -->|SOP Text| A5
     A5 -->|Application Package| UI
-
-    style UI fill:#e1f5ff
-    style A1 fill:#d4edda
-    style A2 fill:#d4edda
-    style A3 fill:#d4edda
-    style A4 fill:#d4edda
-    style A5 fill:#d1e7dd
 ```
 
 ### How It Works

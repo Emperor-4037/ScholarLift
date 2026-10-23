@@ -92,16 +92,6 @@ graph TB
     AGENT3 -->|Web Fetch| WEB
     AGENT4 -->|Reasoning| LLM
     AGENT5 -->|SOP Draft| LLM
-
-    style UI fill:#e1f5ff
-    style INTAKE fill:#fff4e1
-    style AGENT1 fill:#d4edda
-    style AGENT2 fill:#d4edda
-    style AGENT3 fill:#d4edda
-    style AGENT4 fill:#d4edda
-    style AGENT5 fill:#d1e7dd
-    style BUS fill:#f8d7da
-    style CB fill:#ffeaa7
 ```
 
 ## Hexagonal Architecture (Ports & Adapters)
@@ -160,18 +150,4 @@ graph TB
     ADAPT_FETCH --> EXT_WEB
     ADAPT_PDF --> EXT_WEB
     ADAPT_GITHUB --> EXT_GITHUB_DB
-
-    style DOMAIN fill:#d1c4e9
-    style PORT_LLM fill:#c5cae9
-    style PORT_SEARCH fill:#c5cae9
-    style PORT_FETCH fill:#c5cae9
-    style PORT_DOC fill:#c5cae9
-    style PORT_PROFILE fill:#c5cae9
-    style ADAPT_GEMINI fill:#b2dfdb
-    style ADAPT_OPENAI fill:#b2dfdb
-    style ADAPT_TAVILY fill:#b2dfdb
-    style ADAPT_JINA fill:#b2dfdb
-    style ADAPT_FETCH fill:#b2dfdb
-    style ADAPT_PDF fill:#b2dfdb
-    style ADAPT_GITHUB fill:#b2dfdb
 ```
