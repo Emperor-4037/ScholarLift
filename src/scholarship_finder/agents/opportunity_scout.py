@@ -14,7 +14,6 @@ DEC-1: fast tier only for query planning. No reasoning tier calls here.
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Any
@@ -41,32 +40,73 @@ from scholarship_finder.ports.search import SearchPort
 logger = logging.getLogger(__name__)
 
 # Maximum URLs to pass forward
-_MAX_CANDIDATES = 30
+_MAX_CANDIDATES = 20  # Reduced from 30 for token efficiency
+
+# Trusted domain lists for domain-constrained search
+_TRUSTED_SCHOLARSHIP_DOMAINS = [
+    ".gov",  # Government agencies
+    ".edu",  # Universities and colleges
+    "scholarships.com",
+    "fastweb.com",
+    "bigfuture.collegeboard.org",
+    "scholarshipamerica.org",
+    "careeronestop.org",
+]
+
+_TRUSTED_PROGRAM_DOMAINS = [
+    ".edu",  # Universities and colleges
+]
+
+_TRUSTED_FUNDER_DOMAINS = [
+    ".gov",  # Government agencies
+    ".edu",  # University foundations
+    "foundationcenter.org",
+    "grant.gov",
+    "nsf.gov",
+    "nih.gov",
+]
+
+# Feature toggle for query variants (disabled by default to control API costs)
+_ENABLE_QUERY_VARIANTS = False
 
 _QUERY_PLAN_PROMPT = """\
-You are a search strategist. Given a candidate's academic profile (below), \
-generate a precise JSON search plan to find graduate opportunities.
+You are an expert search strategist specializing in funding opportunities. Given a candidate's academic profile (below), \
+generate a precise JSON search plan to find graduate opportunities WITH FUNDING using query expansion techniques.
 
 Return ONLY valid JSON (no markdown):
 {{
   "queries": [
     {{
-      "text": "<specific search query string>",
+      "text": "<specific search query string, max 400 characters>",
       "intent": "<one of: program | scholarship | funder>",
       "country": "<country name or null>",
-      "depth": "<basic or advanced>"
+      "depth": "<basic or advanced>",
+      "reasoning": "<brief explanation of why this query will find funding opportunities>"
     }},
     ...
   ]
 }}
 
-Rules:
+Query Construction Rules:
 - Generate exactly {num_queries} queries.
 - Cover at least 2 distinct intents (program, scholarship, funder).
-- Queries must be specific and search-engine optimized (include degree level, field, country).
+- CRITICAL: For scholarship intent, ALWAYS include funding keywords: "fully funded", "financial aid", "stipend", "tuition waiver", "grant", "fellowship"
+- For program intent, include "with funding", "scholarship", "assistantship", or "fellowship" to ensure funding availability
+- For funder intent, target organizations: "foundation", "endowment", "grant", "funding organization"
+- Use synonyms to increase recall (e.g., "scholarship OR grant OR fellowship")
+- Include degree level, field, and country for specificity
+- Use quotes for exact phrases when appropriate (e.g., "fully funded" OR "tuition waiver")
 - Do NOT use candidate names or personal information.
 - Do NOT generate duplicate-intent, duplicate-country pairs.
 - depth should be "advanced" for scholarship/funder queries (more results needed).
+- Keep each query under 400 characters for API compatibility.
+- Focus on FINDING OPPORTUNITIES WITH ACTUAL FUNDING, not just general admissions.
+
+Query Expansion Strategy:
+- Mix broad and specific queries to capture both popular and niche opportunities
+- Include both direct funding terms and institutional funding language
+- Use OR operators for synonyms when space permits
+- Consider alternative field names and broader category terms
 
 Candidate summary:
 - Degree level sought: {degree_level}
@@ -209,12 +249,33 @@ class OpportunityScoutAgent:
         queries: list[SearchQuery] = []
         for i, q in enumerate(queries_raw[:num_queries]):
             try:
+                query_text = str(q.get("text", ""))
+                # Validate query length for Tavily API (max 400 chars)
+                if len(query_text) > 400:
+                    logger.warning("Query %d exceeds 400 chars, truncating: %s", i, query_text[:60])
+                    query_text = query_text[:400]
+                
+                # Log query quality metrics
+                funding_keywords = ["funded", "funding", "scholarship", "grant", "fellowship", 
+                                    "stipend", "tuition waiver", "financial aid", "assistantship"]
+                keyword_count = sum(1 for kw in funding_keywords if kw.lower() in query_text.lower())
+                reasoning = q.get("reasoning", "")
+                
+                logger.info(
+                    "Query %d: intent=%s, country=%s, funding_keywords=%d, length=%d, reasoning=%s",
+                    i, q.get("intent"), q.get("country"), keyword_count, len(query_text), reasoning[:50]
+                )
+                
+                # Apply domain filtering for some queries (alternate between filtered and unfiltered)
+                intent = str(q.get("intent", "program"))
+                include_domains = _get_trusted_domains(intent) if i % 2 == 0 else []
+                
                 queries.append(SearchQuery(
                     id=str(uuid.uuid4()),
-                    text=str(q.get("text", "")),
-                    intent=str(q.get("intent", "program")),
+                    text=query_text,
+                    intent=intent,
                     country=q.get("country"),
-                    include_domains=[],
+                    include_domains=include_domains,
                     exclude_domains=[],
                     depth=str(q.get("depth", "basic")),
                     round_number=round_number,
@@ -231,14 +292,29 @@ class OpportunityScoutAgent:
     async def _execute_searches(
         self, plan: SearchPlan, run_id: str
     ) -> list[dict[str, Any]]:
-        """Execute all queries concurrently; merge results."""
+        """Execute all queries concurrently; merge results.
+        
+        If query variants are enabled, generates and executes variants for each query
+        to improve recall through diverse search strategies.
+        """
         import asyncio
 
-        tasks = [self._search_one(q) for q in plan.queries]
+        # Generate query variants if enabled
+        if _ENABLE_QUERY_VARIANTS:
+            logger.info("Query variants enabled - generating expanded search set")
+            all_queries: list[SearchQuery] = []
+            for q in plan.queries:
+                variants = _generate_query_variants(q)
+                all_queries.extend(variants)
+            logger.info("Generated %d total queries from %d base queries", len(all_queries), len(plan.queries))
+        else:
+            all_queries = plan.queries
+
+        tasks = [self._search_one(q) for q in all_queries]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         all_items: list[dict[str, Any]] = []
-        for q, result in zip(plan.queries, results):
+        for q, result in zip(all_queries, results):
             if isinstance(result, Exception):
                 logger.warning("Search failed for query %r: %s", q.text[:60], result)
                 # Try secondary if available
@@ -248,8 +324,10 @@ class OpportunityScoutAgent:
                         all_items.extend(secondary_result)
                     except Exception as exc2:
                         logger.warning("Secondary search also failed: %s", exc2)
-            else:
+            elif isinstance(result, list):
                 all_items.extend(result)
+            else:
+                logger.warning("Unexpected result type for query %r: %s", q.text[:60], type(result))
 
         return all_items
 
@@ -266,7 +344,7 @@ class OpportunityScoutAgent:
             text=query.text,
             intent=query.intent,
             country=query.country,
-            max_results=10,
+            max_results=15,  # Reduced from 25 for token efficiency
             depth=query.depth,
             include_domains=query.include_domains if query.include_domains else [],
             exclude_domains=query.exclude_domains if query.exclude_domains else [],
@@ -348,18 +426,90 @@ def _tier_rank(tier: TrustTier) -> int:
     }.get(tier, 0)
 
 
+def _get_trusted_domains(intent: str) -> list[str]:
+    """Return trusted domain list for a given intent."""
+    if intent == "scholarship":
+        return _TRUSTED_SCHOLARSHIP_DOMAINS
+    elif intent == "program":
+        return _TRUSTED_PROGRAM_DOMAINS
+    elif intent == "funder":
+        return _TRUSTED_FUNDER_DOMAINS
+    return []
+
+
+def _generate_query_variants(base_query: SearchQuery) -> list[SearchQuery]:
+    """Generate query variants for improved recall and precision.
+    
+    Creates 2-3 variants per base query:
+    1. Exact phrase match (with quotes)
+    2. Synonym expansion (if space permits)
+    3. Domain-constrained (if not already applied)
+    
+    Returns list of variants including the original.
+    """
+    import uuid
+    import re
+    
+    variants = [base_query]
+    base_text = base_query.text
+    
+    # Variant 1: Add quotes for exact phrase matching (if not already quoted)
+    if '"' not in base_text and len(base_text) < 350:
+        # Identify key phrases to quote (2-3 word sequences)
+        words = base_text.split()
+        if len(words) >= 3:
+            # Quote the first 2-3 meaningful words
+            quote_phrase = ' '.join(words[:3])
+            quoted_text = base_text.replace(quote_phrase, f'"{quote_phrase}"', 1)
+            if quoted_text != base_text and len(quoted_text) <= 400:
+                variants.append(SearchQuery(
+                    id=str(uuid.uuid4()),
+                    text=quoted_text,
+                    intent=base_query.intent,
+                    country=base_query.country,
+                    include_domains=base_query.include_domains,
+                    exclude_domains=base_query.exclude_domains,
+                    depth=base_query.depth,
+                    round_number=base_query.round_number,
+                ))
+    
+    # Variant 2: Add domain constraint if not already present
+    if not base_query.include_domains:
+        trusted_domains = _get_trusted_domains(base_query.intent)
+        if trusted_domains:
+            # Apply only a subset of domains to avoid over-restriction
+            subset_domains = trusted_domains[:3]  # Top 3 most trusted
+            variants.append(SearchQuery(
+                id=str(uuid.uuid4()),
+                text=base_text,
+                intent=base_query.intent,
+                country=base_query.country,
+                include_domains=subset_domains,
+                exclude_domains=base_query.exclude_domains,
+                depth=base_query.depth,
+                round_number=base_query.round_number,
+            ))
+    
+    return variants
+
+
 def _fallback_queries(profile: Any, round_number: int) -> list[SearchQuery]:
-    """Minimal fallback when LLM query planning completely fails."""
+    """Enhanced fallback with query expansion when LLM query planning fails.
+    
+    Uses multiple funding keyword variants and synonyms to improve recall.
+    """
     import uuid
     prefs = profile.preferences
     country = prefs.countries[0] if prefs.countries else "international"
     field = prefs.target_fields[0] if prefs.target_fields else "graduate"
     level = prefs.degree_level or "masters"
 
+    # Query expansion: multiple keyword variants for each intent
     return [
+        # Variant 1: Direct funding terms with exact phrase matching
         SearchQuery(
             id=str(uuid.uuid4()),
-            text=f"{level} {field} scholarship {country} funded",
+            text=f'"fully funded" {level} {field} scholarship {country} stipend',
             intent="scholarship",
             country=country,
             include_domains=[],
@@ -367,14 +517,48 @@ def _fallback_queries(profile: Any, round_number: int) -> list[SearchQuery]:
             depth="advanced",
             round_number=round_number,
         ),
+        # Variant 2: Synonym expansion for financial aid
         SearchQuery(
             id=str(uuid.uuid4()),
-            text=f"{level} program {field} {country} admissions",
+            text=f'{level} {field} scholarship {country} (financial aid OR "tuition waiver" OR grant)',
+            intent="scholarship",
+            country=country,
+            include_domains=[],
+            exclude_domains=[],
+            depth="advanced",
+            round_number=round_number,
+        ),
+        # Variant 3: Program funding with institutional language
+        SearchQuery(
+            id=str(uuid.uuid4()),
+            text=f'{level} program {field} {country} "with funding" OR assistantship OR fellowship',
             intent="program",
             country=country,
             include_domains=[],
             exclude_domains=[],
-            depth="basic",
+            depth="advanced",
+            round_number=round_number,
+        ),
+        # Variant 4: International-specific funding opportunities
+        SearchQuery(
+            id=str(uuid.uuid4()),
+            text=f'"fully funded" {level} scholarship {country} international students OR global',
+            intent="scholarship",
+            country=country,
+            include_domains=[],
+            exclude_domains=[],
+            depth="advanced",
+            round_number=round_number,
+        ),
+        # Variant 5: Research-focused funding and fellowships
+        SearchQuery(
+            id=str(uuid.uuid4()),
+            text=f'{field} graduate fellowship {country} "research funding" OR grant OR endowment',
+            intent="funder",
+            country=country,
+            include_domains=[],
+            exclude_domains=[],
+            depth="advanced",
             round_number=round_number,
         ),
     ]
