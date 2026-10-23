@@ -43,14 +43,11 @@ logger = logging.getLogger(__name__)
 _MAX_CANDIDATES = 20  # Reduced from 30 for token efficiency
 
 # Trusted domain lists for domain-constrained search
+# Note: Removed aggregators (scholarships.com, fastweb.com, etc.) - only official domains
 _TRUSTED_SCHOLARSHIP_DOMAINS = [
     ".gov",  # Government agencies
     ".edu",  # Universities and colleges
-    "scholarships.com",
-    "fastweb.com",
-    "bigfuture.collegeboard.org",
-    "scholarshipamerica.org",
-    "careeronestop.org",
+    # Removed: scholarships.com, fastweb.com, bigfuture.collegeboard.org (aggregators)
 ]
 
 _TRUSTED_PROGRAM_DOMAINS = [
@@ -64,6 +61,36 @@ _TRUSTED_FUNDER_DOMAINS = [
     "grant.gov",
     "nsf.gov",
     "nih.gov",
+]
+
+# Domains to exclude from search results (aggregators and listing sites)
+_EXCLUDE_DOMAINS = [
+    "scholarships.com",
+    "fastweb.com",
+    "bigfuture.collegeboard.org",
+    "scholarshipamerica.org",
+    "onlinemastersdegrees.com",
+    "studyportals.com",
+    "mastersportal.eu",
+    "phdportal.eu",
+    "findamasters.com",
+    "findaphd.com",
+    "opportunitydesk.org",
+    "youthop.com",
+    "scholarship-positions.com",
+    "afterschoolafrica.com",
+    "opportunitiesforafricans.com",
+    "scholars.co",
+    "studyabroad.com",
+    "idp.com",
+    "studylink.com",
+    "niche.com",
+    "cappex.com",
+    "unigo.com",
+    "chegg.com",
+    "scholarshipowl.com",
+    "scholarships360.org",
+    "scholarshiptab.com",
 ]
 
 # Feature toggle for query variants (disabled by default to control API costs)
@@ -182,6 +209,23 @@ class OpportunityScoutAgent:
         # Merge with existing candidates
         new_state.candidates = reduce_candidates(state.candidates, new_candidates)
 
+        # Phase 2.2: Emit incremental progress for staircase streaming
+        # This allows downstream agents to start processing before all searches complete
+        if len(new_candidates) >= 5:  # Minimum threshold for streaming
+            await bus.publish(Event(
+                run_id=run_id,
+                seq=0,
+                timestamp=datetime.now(timezone.utc),
+                node="opportunity_scout",
+                severity=EventSeverity.INFO,
+                kind=EventKind.PROGRESS,
+                payload={
+                    "stage": "incremental_candidates",
+                    "count": len(new_state.candidates),
+                    "round": round_number,
+                },
+            ))
+
         await bus.publish(Event(
             run_id=run_id,
             seq=0,
@@ -276,7 +320,7 @@ class OpportunityScoutAgent:
                     intent=intent,
                     country=q.get("country"),
                     include_domains=include_domains,
-                    exclude_domains=[],
+                    exclude_domains=_EXCLUDE_DOMAINS,  # Exclude aggregators from all queries
                     depth=str(q.get("depth", "basic")),
                     round_number=round_number,
                 ))
@@ -513,7 +557,7 @@ def _fallback_queries(profile: Any, round_number: int) -> list[SearchQuery]:
             intent="scholarship",
             country=country,
             include_domains=[],
-            exclude_domains=[],
+            exclude_domains=_EXCLUDE_DOMAINS,
             depth="advanced",
             round_number=round_number,
         ),
@@ -524,7 +568,7 @@ def _fallback_queries(profile: Any, round_number: int) -> list[SearchQuery]:
             intent="scholarship",
             country=country,
             include_domains=[],
-            exclude_domains=[],
+            exclude_domains=_EXCLUDE_DOMAINS,
             depth="advanced",
             round_number=round_number,
         ),
@@ -535,7 +579,7 @@ def _fallback_queries(profile: Any, round_number: int) -> list[SearchQuery]:
             intent="program",
             country=country,
             include_domains=[],
-            exclude_domains=[],
+            exclude_domains=_EXCLUDE_DOMAINS,
             depth="advanced",
             round_number=round_number,
         ),
@@ -546,7 +590,7 @@ def _fallback_queries(profile: Any, round_number: int) -> list[SearchQuery]:
             intent="scholarship",
             country=country,
             include_domains=[],
-            exclude_domains=[],
+            exclude_domains=_EXCLUDE_DOMAINS,
             depth="advanced",
             round_number=round_number,
         ),
@@ -557,7 +601,7 @@ def _fallback_queries(profile: Any, round_number: int) -> list[SearchQuery]:
             intent="funder",
             country=country,
             include_domains=[],
-            exclude_domains=[],
+            exclude_domains=_EXCLUDE_DOMAINS,
             depth="advanced",
             round_number=round_number,
         ),

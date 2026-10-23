@@ -75,6 +75,7 @@ For each page, extract the following fields if present:
 - eligibility: list of key eligibility requirements (citizenship, GPA, field of study, etc.)
 - requirements: list of any additional requirements (documents, tests, etc.)
 - kind: PROGRAM, SCHOLARSHIP, or PROGRAM_WITH_FUNDING
+- is_listing_page: boolean (true if this page lists multiple scholarships or is a database/directory, false if it describes ONE specific scholarship/program)
 
 Return ONLY valid JSON array (no markdown):
 [
@@ -90,6 +91,7 @@ Return ONLY valid JSON array (no markdown):
     "eligibility": ["<string>", ...],
     "requirements": ["<string>", ...],
     "kind": "<string or null>",
+    "is_listing_page": <boolean>,
     "evidence_spans": {{
       "name": "<verbatim span from text, 15-400 chars or null>",
       "institution_or_funder": "<verbatim span or null>",
@@ -116,6 +118,12 @@ Rules:
 - CRITICAL: For funding, look for keywords like "fully funded", "stipend", "tuition waiver", "financial aid", "scholarship", "fellowship", "grant", "living allowance", "monthly stipend".
 - CRITICAL: If the page is a general degree program page with NO mention of funding, scholarships, or financial aid, set funding_level to "NONE" and mark it as not a scholarship opportunity.
 - Set kind to "SCHOLARSHIP" if the page mentions scholarships, funding, or financial aid. Set to "PROGRAM" only if it's a general degree page without funding.
+- CRITICAL: Determine if this page is a listing page (NOT a direct scholarship):
+  - Set is_listing_page = true if: page lists multiple scholarships, has search/filter features, is a scholarship database/directory, or contains generic text like "find scholarships", "scholarship database", "directory of scholarships"
+  - Set is_listing_page = false if: page describes ONE specific scholarship/program with specific eligibility, funding details, and application process
+  - Set is_listing_page = false if: page is from an official university (.edu) or government (.gov) domain describing their own scholarship program
+  - Examples of listing pages: "Scholarships & Resources for Data Science", "Find Scholarships", "Scholarship Database", "Graduate Programs Directory"
+  - Examples of direct pages: "DeepMind Scholarship 2026", "DAAD Scholarship Program", "University of XYZ Graduate Fellowship"
 - ENSURE VALID JSON: All strings must be properly escaped. The JSON must parse without errors.
 - For evidence_spans: Select clean, continuous text segments (15-400 chars) that avoid quotes, special characters, and line breaks. Prefer spans from single sentences or phrases.
 
@@ -141,6 +149,71 @@ class SourceAuditorAgent:
         # This is a heuristic - if we detect unescaped quotes in string values, try to fix
         # Note: This is a best-effort repair and may not handle all cases
         return json_str
+
+    def _is_listing_page(self, data: dict, page_text: str) -> bool:
+        """Detect if the page is a scholarship listing/aggregator page.
+        
+        Returns True if the page lists multiple scholarships or is a database/directory.
+        Returns False if the page describes a single specific scholarship/program.
+        """
+        name = data.get("name", "").lower()
+        institution = data.get("institution_or_funder", "").lower()
+        
+        # Check if LLM explicitly marked it as a listing page
+        if data.get("is_listing_page") == True:
+            logger.info("LLM classified as listing page: %s from %s", name, institution)
+            return True
+        
+        # Check for listing keywords in name
+        listing_keywords = [
+            "scholarships & resources",
+            "find scholarships",
+            "scholarship database",
+            "directory",
+            "list of",
+            "scholarship finder",
+            "search scholarships",
+            "online master's degrees",
+            "graduate programs",
+            "masters portal",
+            "phd portal",
+            "find a masters",
+            "find a phd",
+            "scholarship positions",
+            "opportunities for",
+            "scholarships for"
+        ]
+        
+        # Check name for listing indicators
+        for kw in listing_keywords:
+            if kw in name:
+                logger.info("Name contains listing keyword '%s': %s", kw, name)
+                return True
+        
+        # Check institution for generic/indicators
+        generic_institutions = [
+            "online master's degrees",
+            "scholarship finder",
+            "study portal",
+            "masters portal",
+            "phd portal",
+            "studyportals",
+            "youth opportunities",
+            "opportunity desk"
+        ]
+        
+        for gen in generic_institutions:
+            if gen in institution:
+                logger.info("Institution is generic '%s': %s", gen, institution)
+                return True
+        
+        # Check if name is very generic without specific program name
+        # E.g., "Scholarships" vs "DeepMind Scholarship 2026"
+        if name in ["scholarships", "funding", "graduate funding", "scholarship"]:
+            logger.info("Name is too generic: %s", name)
+            return True
+        
+        return False
 
     # ── Mapper function for Send API (Phase 2.1) ───────────────────────────────
 
@@ -390,17 +463,6 @@ class SourceAuditorAgent:
         # Deduplicate and limit
         return list(dict.fromkeys(relevant_urls))[:5]  # Max 5 links per page
 
-    def _clean_json_string(self, json_str: str) -> str:
-        """Clean and repair common JSON issues from LLM output."""
-        # Remove control characters except \n, \r, \t
-        import re
-        json_str = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', json_str)
-        
-        # Fix common quote escaping issues in evidence_spans
-        # This is a heuristic - if we detect unescaped quotes in string values, try to fix
-        # Note: This is a best-effort repair and may not handle all cases
-        return json_str
-
     async def _extract_and_verify_batch(
         self,
         batch: list[tuple[Candidate, str | None]],
@@ -483,6 +545,11 @@ class SourceAuditorAgent:
         name = data.get("name")
         if not name:
             return None  # Can't build an opportunity without a name
+
+        # Filter out listing/aggregator pages (Phase 1 fix)
+        if self._is_listing_page(data, page_text):
+            logger.info("Filtering out listing page: %s", name)
+            return None
 
         # Filter out general program pages with no funding
         funding_level_str = data.get("funding_level", "").upper()
