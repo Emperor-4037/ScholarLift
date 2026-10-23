@@ -237,9 +237,7 @@ ScholarShip_Finder/
 
 ---
 
-## Architecture Decisions
-
-See [`DECISIONS.md`](DECISIONS.md) for all deviations from the architecture report and their rationale.
+## Architecture Documentation
 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for detailed system architecture diagrams.
 
@@ -247,7 +245,7 @@ See [`TECHNICAL_CHALLENGE.md`](TECHNICAL_CHALLENGE.md) for the most interesting 
 
 See [`DEMO_RECORDING_GUIDE.md`](DEMO_RECORDING_GUIDE.md) for instructions on recording the demo video.
 
-Key decisions:
+### Key Implementation Decisions
 - **DEC-IMPL-001**: Single `models.py` (avoids Pydantic v2 forward-ref issues)
 - **DEC-IMPL-002**: `google-genai` SDK (recommended replacement for deprecated `google-generativeai`)
 - **DEC-IMPL-006**: Single `decorate()` composition entry point for the 6-layer middleware

@@ -5,7 +5,7 @@
 ```mermaid
 graph TB
     subgraph "User Interface"
-        UI[Streamlit UI]
+        UI[FastAPI Web UI]
     end
 
     subgraph "Intake Layer"
@@ -275,7 +275,7 @@ graph TB
 ```mermaid
 sequenceDiagram
     participant User
-    participant UI as Streamlit UI
+    participant UI as FastAPI Web UI
     participant Intake as Intake Service
     participant Vault as PII Vault
     participant Bus as Event Bus
@@ -356,9 +356,9 @@ graph TB
 
 ```mermaid
 graph TB
-    subgraph "Streamlit Main Thread"
-        UI[Streamlit UI]
-        SCRIPT[Script Runner]
+    subgraph "FastAPI Main Thread"
+        UI[FastAPI Web UI]
+        API[API Endpoints]
     end
 
     subgraph "Background Thread (per run)"
@@ -372,16 +372,16 @@ graph TB
         VAULT[PII Vault]
     end
 
-    UI -->|User Upload| SCRIPT
-    SCRIPT -->|start_run_with_intake| UI
+    UI -->|User Upload| API
+    API -->|start_run_with_intake| UI
     UI -->|Launch Thread| BG_LOOP
     BG_LOOP --> GRAPH
     GRAPH --> AGENTS
     AGENTS -->|Publish Events| BUS
-    BUS -->|Poll| UI
+    BUS -->|SSE Events| UI
 
     style UI fill:#e1f5ff
-    style SCRIPT fill:#fff4e1
+    style API fill:#fff4e1
     style BG_LOOP fill:#d4edda
     style GRAPH fill:#d4edda
     style AGENTS fill:#d4edda
