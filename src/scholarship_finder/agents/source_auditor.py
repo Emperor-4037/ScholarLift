@@ -19,7 +19,6 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Any
 
 from scholarship_finder.domain.models import (
     Candidate,
@@ -36,34 +35,45 @@ from scholarship_finder.domain.models import (
     OpportunityField,
     OpportunityKind,
     SwarmState,
-    TrustTier,
     VerificationResult,
 )
+from typing import TypedDict
 from scholarship_finder.domain.reducers import reduce_opportunities
 from scholarship_finder.domain.span_verifier import verify_span
-from scholarship_finder.domain.trust import classify_domain
 from scholarship_finder.engine.event_bus import EventBus
 from scholarship_finder.ports.fetch import FetchPort
 from scholarship_finder.ports.llm import LLMPort, TaskSpec
 
 logger = logging.getLogger(__name__)
 
-_WAVE_SIZE = 6        # URLs fetched in parallel per wave
-_BATCH_SIZE = 4       # Pages per LLM extraction call
-_EARLY_STOP = 10      # Stop after this many verified opportunities
-_MAX_WAVES = 5        # Hard cap on total waves
+_WAVE_SIZE = 10       # URLs fetched in parallel per wave (balanced for quality vs efficiency)
+_BATCH_SIZE = 5        # Pages per LLM extraction call (balanced for quality vs efficiency)
+_EARLY_STOP = 20       # Stop after this many verified opportunities (increased for better results)
+_MAX_WAVES = 4         # Hard cap on total waves (increased for better coverage)
+_RECURSIVE_DEPTH = 1  # Number of levels to follow links (reduced for token efficiency)
+_MAX_CONCURRENT_FETCHES = 6  # Conservative concurrency for Send API (Phase 2.1)
+
+
+# ── Mapper State for Send API (Phase 2.1) ─────────────────────────────────────
+
+class MapperState(TypedDict):
+    """State for a single candidate fetch/extract mapper node."""
+    candidate: Candidate
+    run_id: str
 
 _EXTRACT_PROMPT = """\
 Extract structured opportunity data from the following web page excerpts.
 
 For each page, extract the following fields if present:
 - name: program/scholarship name
-- institution_or_funder: offering institution or funding body
-- country: host country
-- degree_level: e.g. masters, phd, bachelors, postdoc
+- institution_or_funder: offering institution or funding body (LOOK CAREFULLY for university name, organization name, or funding body name)
+- country: host country or countries (LOOK for country names like Germany, Canada, USA, UK, etc.)
+- degree_level: e.g. masters, phd, bachelors, postdoc, undergraduate
 - funding_level: one of FULL_TUITION_STIPEND, FULL_TUITION, PARTIAL, NONE, UNKNOWN
+- funding_details: specific funding amount or description (stipend, tuition, etc.)
 - deadline: application deadline (date string or description)
-- requirements: list of key eligibility requirements (strings)
+- eligibility: list of key eligibility requirements (citizenship, GPA, field of study, etc.)
+- requirements: list of any additional requirements (documents, tests, etc.)
 - kind: PROGRAM, SCHOLARSHIP, or PROGRAM_WITH_FUNDING
 
 Return ONLY valid JSON array (no markdown):
@@ -75,14 +85,18 @@ Return ONLY valid JSON array (no markdown):
     "country": "<string or null>",
     "degree_level": "<string or null>",
     "funding_level": "<string or null>",
+    "funding_details": "<string or null>",
     "deadline": "<string or null>",
+    "eligibility": ["<string>", ...],
     "requirements": ["<string>", ...],
     "kind": "<string or null>",
     "evidence_spans": {{
       "name": "<verbatim span from text, 15-400 chars or null>",
       "institution_or_funder": "<verbatim span or null>",
       "funding_level": "<verbatim span or null>",
-      "deadline": "<verbatim span or null>"
+      "deadline": "<verbatim span or null>",
+      "country": "<verbatim span or null>",
+      "degree_level": "<verbatim span or null>"
     }}
   }},
   ...
@@ -92,7 +106,18 @@ Rules:
 - Extract ONLY what is explicitly present in the page text.
 - Use null for any missing field.
 - evidence_spans must be verbatim substrings from the page text (case-sensitive).
+- CRITICAL: If evidence spans contain quotes, backslashes, or special characters, either:
+  1. Escape them properly using backslashes (\" for quotes, \\ for backslashes, \n for newlines), OR
+  2. Use a shorter, cleaner span that avoids special characters
 - If a page has no relevant content, include the entry with all fields null.
+- Pay special attention to eligibility criteria, citizenship requirements, and funding details.
+- CRITICAL: Look carefully for institution names, university names, and country names - these are often in headers, titles, or introductory text.
+- CRITICAL: For country, look for phrases like "in Germany", "Canada", "United States", "UK", "USA", etc.
+- CRITICAL: For funding, look for keywords like "fully funded", "stipend", "tuition waiver", "financial aid", "scholarship", "fellowship", "grant", "living allowance", "monthly stipend".
+- CRITICAL: If the page is a general degree program page with NO mention of funding, scholarships, or financial aid, set funding_level to "NONE" and mark it as not a scholarship opportunity.
+- Set kind to "SCHOLARSHIP" if the page mentions scholarships, funding, or financial aid. Set to "PROGRAM" only if it's a general degree page without funding.
+- ENSURE VALID JSON: All strings must be properly escaped. The JSON must parse without errors.
+- For evidence_spans: Select clean, continuous text segments (15-400 chars) that avoid quotes, special characters, and line breaks. Prefer spans from single sentences or phrases.
 
 Pages:
 {pages_block}
@@ -105,6 +130,46 @@ class SourceAuditorAgent:
     def __init__(self, llm_port: LLMPort, fetch_port: FetchPort) -> None:
         self._llm = llm_port
         self._fetch = fetch_port
+
+    def _clean_json_string(self, json_str: str) -> str:
+        """Clean and repair common JSON issues from LLM output."""
+        # Remove control characters except \n, \r, \t
+        import re
+        json_str = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', json_str)
+        
+        # Fix common quote escaping issues in evidence_spans
+        # This is a heuristic - if we detect unescaped quotes in string values, try to fix
+        # Note: This is a best-effort repair and may not handle all cases
+        return json_str
+
+    # ── Mapper function for Send API (Phase 2.1) ───────────────────────────────
+
+    async def fetch_and_verify_candidate(
+        self, mapper_state: MapperState, bus: EventBus
+    ) -> dict:
+        """Mapper node: fetch and verify a single candidate (for Send API).
+
+        Returns a dict with verified opportunities list.
+        """
+        candidate = mapper_state["candidate"]
+        run_id = mapper_state["run_id"]
+
+        try:
+            # Fetch the candidate's page
+            page_text, _ = await self._fetch_one(candidate)
+
+            if not page_text:
+                return {"verified_opps": []}
+
+            # Extract and verify (batch size of 1 for mapper)
+            batch = [(candidate, page_text)]
+            opportunities = await self._extract_and_verify_batch(batch, [])
+
+            return {"verified_opps": opportunities}
+
+        except Exception as exc:
+            logger.debug("Mapper failed for %s: %s", candidate.canonical_url, exc)
+            return {"verified_opps": []}
 
     async def run(self, state: SwarmState, bus: EventBus) -> SwarmState:
         """Audit candidates to build a verified Opportunity list."""
@@ -184,28 +249,157 @@ class SourceAuditorAgent:
     # ── Private helpers ───────────────────────────────────────────────────────
 
     async def _fetch_wave(
-        self, wave: list[Candidate], run_id: str
+        self, wave: list[Candidate], run_id: str, depth: int = 0
     ) -> list[tuple[Candidate, str | None]]:
-        """Fetch a wave of URLs in parallel. Returns (candidate, text_or_none) pairs."""
+        """Fetch a wave of URLs in parallel. Returns (candidate, text_or_none) pairs.
+        
+        If depth < _RECURSIVE_DEPTH, also fetch linked pages from listing pages.
+        """
         tasks = [self._fetch_one(c) for c in wave]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         pairs: list[tuple[Candidate, str | None]] = []
+        additional_candidates: list[Candidate] = []
+        
         for c, result in zip(wave, results):
             if isinstance(result, Exception):
                 logger.debug("Fetch failed for %s: %s", c.canonical_url, result)
                 pairs.append((c, None))
             else:
-                pairs.append((c, result))
+                page_text, links = result
+                pairs.append((c, page_text))
+                
+                # If we found links and haven't reached max depth, queue them
+                if links and depth < _RECURSIVE_DEPTH:
+                    from urllib.parse import urlparse
+                    for link in links:
+                        parsed = urlparse(link)
+                        additional_candidates.append(Candidate(
+                            url=link,
+                            canonical_url=link,
+                            domain=parsed.netloc or "",
+                            kind_hint=c.kind_hint,
+                            trust_tier=c.trust_tier,
+                            source_query_id="recursive_link",
+                        ))
+        
+        # If we have additional candidates and haven't reached max depth, fetch them
+        if additional_candidates and depth < _RECURSIVE_DEPTH:
+            logger.info("SourceAuditor: fetching %d linked pages at depth %d", 
+                        len(additional_candidates), depth + 1)
+            recursive_pairs = await self._fetch_wave(additional_candidates, run_id, depth + 1)
+            pairs.extend(recursive_pairs)
+        
         return pairs
 
-    async def _fetch_one(self, candidate: Candidate) -> str | None:
-        """Fetch a single URL and return page text (or None on failure)."""
+    async def _fetch_one(self, candidate: Candidate) -> tuple[str | None, list[str]]:
+        """Fetch a single URL and return (page_text, linked_urls) or (None, [])."""
         try:
             doc = await self._fetch.fetch(candidate.canonical_url)
-            return doc.normalized_text if doc else None
+            if not doc:
+                return None, []
+            
+            # Extract links that look like actual scholarship pages
+            links = self._extract_relevant_links(doc.normalized_text, candidate.canonical_url)
+            return doc.normalized_text, links
         except Exception as exc:
             logger.debug("Fetch error for %s: %s", candidate.canonical_url, exc)
-            return None
+            return None, []
+
+    def _extract_relevant_sections(self, page_text: str) -> str:
+        """Extract only relevant sections from page text to reduce token usage.
+
+        Looks for keywords related to scholarships, funding, deadlines, eligibility, etc.
+        and extracts paragraphs containing these keywords along with nearby context.
+        """
+        import re
+
+        # Keywords that indicate relevant sections
+        relevant_keywords = [
+            'scholarship', 'funding', 'financial aid', 'stipend', 'tuition',
+            'deadline', 'application', 'eligible', 'eligibility', 'requirement',
+            'program', 'degree', 'master', 'phd', 'bachelor', 'graduate',
+            'admission', 'apply', 'criteria', 'citizenship', 'gpa',
+            'ielts', 'toefl', 'language', 'english', 'cost', 'fee'
+        ]
+
+        # Split into paragraphs (by double newlines or period+newline)
+        paragraphs = re.split(r'\n\n+|\.\n', page_text)
+
+        relevant_paragraphs = []
+        for para in paragraphs:
+            para_lower = para.lower()
+            # Check if paragraph contains any relevant keyword
+            if any(kw in para_lower for kw in relevant_keywords):
+                relevant_paragraphs.append(para.strip())
+
+        # If we found relevant sections, use them; otherwise use first few paragraphs
+        if relevant_paragraphs:
+            extracted = '\n\n'.join(relevant_paragraphs[:20])  # Max 20 relevant paragraphs
+        else:
+            # Fallback: use first 10 paragraphs
+            extracted = '\n\n'.join(p.strip() for p in paragraphs[:10] if p.strip())
+
+        # Also extract headers/titles (lines that look like headers)
+        header_pattern = r'^(#{1,3}\s|<h[1-3]>|<strong>|[A-Z][A-Z\s]{5,}:)\s*.+$'
+        headers = re.findall(header_pattern, page_text, re.MULTILINE)
+        if headers:
+            header_text = '\n'.join(headers[:10])
+            extracted = header_text + '\n\n' + extracted
+
+        # Limit to 4000 characters (reasonable for extraction)
+        return extracted[:4000]
+
+    def _extract_relevant_links(self, page_text: str, base_url: str) -> list[str]:
+        """Extract URLs that look like actual scholarship/program pages from listing pages."""
+        import re
+        from urllib.parse import urljoin, urlparse
+        
+        # Pattern to find URLs
+        url_pattern = r'https?://[^\s<>"\'()]+'
+        urls = re.findall(url_pattern, page_text)
+        
+        # Filter URLs that look like actual program pages (not listing pages)
+        relevant_urls = []
+        for url in urls:
+            # Skip if it's the same as base URL
+            if url == base_url:
+                continue
+            
+            # Skip if it looks like a listing/search page
+            skip_keywords = ['search', 'list', 'all', 'index', 'browse', 'results', '?', '&']
+            if any(kw in url.lower() for kw in skip_keywords):
+                continue
+            
+            # Keep URLs that look like individual program pages
+            # Usually they contain program IDs, names, or are direct paths
+            parsed = urlparse(url)
+            path_lower = parsed.path.lower()
+            
+            # Skip very short paths (likely listing pages)
+            if len(parsed.path) < 3 and not parsed.query:
+                continue
+            
+            # Keep if path contains typical program page patterns
+            keep_keywords = ['program', 'scholarship', 'fellowship', 'grant', 'detail', 'view']
+            if any(kw in path_lower for kw in keep_keywords):
+                relevant_urls.append(url)
+            # Also keep if path is reasonably long (likely a specific page)
+            elif len(parsed.path) > 20:
+                relevant_urls.append(url)
+        
+        # Deduplicate and limit
+        return list(dict.fromkeys(relevant_urls))[:5]  # Max 5 links per page
+
+    def _clean_json_string(self, json_str: str) -> str:
+        """Clean and repair common JSON issues from LLM output."""
+        # Remove control characters except \n, \r, \t
+        import re
+        json_str = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', json_str)
+        
+        # Fix common quote escaping issues in evidence_spans
+        # This is a heuristic - if we detect unescaped quotes in string values, try to fix
+        # Note: This is a best-effort repair and may not handle all cases
+        return json_str
 
     async def _extract_and_verify_batch(
         self,
@@ -219,7 +413,7 @@ class SourceAuditorAgent:
             return []
 
         pages_block = "\n\n".join(
-            f"=== Page {i} (URL: {c.canonical_url}) ===\n{text[:3000]}"
+            f"=== Page {i} (URL: {c.canonical_url}) ===\n{self._extract_relevant_sections(text)}"
             for i, (c, text) in enumerate(active)
         )
 
@@ -228,17 +422,41 @@ class SourceAuditorAgent:
             instruction=_EXTRACT_PROMPT.format(pages_block=pages_block),
             data_blocks=[],
             output_schema=None,
-            max_output_tokens=3000,
+            max_output_tokens=2000,  # Reduced to match smaller input size
         )
 
         try:
             result = await self._llm.complete(task)
             raw = result.content.strip()
+            
+            # Strip code fences
             if raw.startswith("```"):
                 raw = raw.split("```")[1]
                 if raw.startswith("json"):
                     raw = raw[4:]
-            extracted = json.loads(raw)
+            
+            # Clean JSON string
+            raw = self._clean_json_string(raw)
+            
+            # Try to parse JSON directly first
+            try:
+                extracted = json.loads(raw)
+            except json.JSONDecodeError as json_err:
+                # Try to fix common JSON issues: unescaped quotes in strings
+                logger.warning("Initial JSON parse failed, attempting repair: %s", json_err)
+                try:
+                    # Simple repair: try to extract just the array content
+                    if '[' in raw and ']' in raw:
+                        start = raw.find('[')
+                        end = raw.rfind(']') + 1
+                        raw = raw[start:end]
+                    extracted = json.loads(raw)
+                except Exception as repair_err:
+                    logger.error("JSON repair failed: %s", repair_err)
+                    # Log the problematic content for debugging
+                    logger.debug("Problematic JSON (first 500 chars): %s", raw[:500])
+                    return []
+                    
         except Exception as exc:
             logger.warning("Extraction batch failed: %s", exc)
             return []
@@ -266,9 +484,28 @@ class SourceAuditorAgent:
         if not name:
             return None  # Can't build an opportunity without a name
 
+        # Filter out general program pages with no funding
+        funding_level_str = data.get("funding_level", "").upper()
+        funding_details_str = data.get("funding_details") or ""
+        kind = data.get("kind", "").upper()
+
+        # Check if this page explicitly has NO funding (filter these out)
+        # Allow pages with UNKNOWN funding or partial funding mentions
+        has_explicit_no_funding = (
+            funding_level_str == "NONE"
+            and not any(kw in funding_details_str.lower() for kw in ["scholarship", "funding", "stipend", "financial aid", "tuition waiver"])
+            and kind != "SCHOLARSHIP"
+        )
+
+        # Skip only pages that explicitly have NO funding
+        if has_explicit_no_funding:
+            logger.debug("Skipping %s - explicitly marked as no funding", name)
+            return None
+
         evidence_spans = data.get("evidence_spans", {}) or {}
         fetched_at = datetime.now(timezone.utc)
 
+        # Phase 3.1: Span verification
         def make_evidence(field_name: str) -> EvidenceRef | None:
             span = evidence_spans.get(field_name)
             if not span:
@@ -301,16 +538,16 @@ class SourceAuditorAgent:
             )
 
         # Funding
-        funding_level_raw = data.get("funding_level", "UNKNOWN")
         try:
-            funding_level = FundingLevel(funding_level_raw.upper())
+            funding_level = FundingLevel(funding_level_str.upper())
         except (ValueError, AttributeError):
             funding_level = FundingLevel.UNKNOWN
 
         funding_evidence = make_evidence("funding_level")
+        funding_details = funding_details_str or data.get("funding_level") or ""
         funding_info = FundingInfo(
             level=funding_level,
-            details=data.get("funding_level") or "",
+            details=funding_details,
             evidence=funding_evidence,
             status=FieldStatus.EVIDENCED if funding_evidence else FieldStatus.UNVERIFIED,
         )
@@ -356,6 +593,8 @@ class SourceAuditorAgent:
             fields=[
                 make_field("name", name),
                 make_field("institution_or_funder", data.get("institution_or_funder")),
+                make_field("country", data.get("country")),
+                make_field("degree_level", data.get("degree_level")),
             ],
             funding=funding_info,
             deadlines=deadlines,
@@ -366,7 +605,7 @@ class SourceAuditorAgent:
                     evidence=None,
                     status=FieldStatus.UNVERIFIED,
                 )
-                for r in (data.get("requirements") or [])
+                for r in (data.get("requirements") or []) + (data.get("eligibility") or [])
             ],
             verification=verification,
         )
@@ -374,6 +613,6 @@ class SourceAuditorAgent:
     @staticmethod
     def _completeness_score(data: dict) -> float:
         """Simple heuristic completeness based on non-null fields."""
-        fields = ["name", "institution_or_funder", "country", "degree_level", "funding_level", "deadline"]
+        fields = ["name", "institution_or_funder", "country", "degree_level", "funding_level", "deadline", "eligibility"]
         present = sum(1 for f in fields if data.get(f))
         return present / len(fields)
