@@ -9,7 +9,7 @@ Key properties:
   from eviction (stored in a separate terminal slot)
 - Cursor-based subscriptions: each subscriber tracks its own read offset
 - **Thread-safe via threading.Lock** — safe to publish from a background
-  thread (the pipeline runner) and read from the Streamlit script thread
+  thread (the pipeline runner) and read from the main thread
 - Zero dependencies outside stdlib + domain models
 
 Usage
@@ -17,19 +17,18 @@ Usage
     bus = EventBus()
     # In agent (async, background thread):
     await bus.publish(Event(run_id="x", seq=1, ...))
-    # In UI (sync, Streamlit script thread):
+    # In UI (sync, main thread):
     events = bus.since(cursor=0)
     cursor = events[-1].seq if events else 0
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 import threading
 from collections import deque
 from typing import Final
 
-from scholarship_finder.domain.models import Event, EventKind, EventSeverity
+from scholarship_finder.domain.models import Event, EventKind
 
 logger = logging.getLogger(__name__)
 
@@ -154,3 +153,20 @@ class EventBus:
     def event_count(self) -> int:
         with self._lock:
             return len(self._ring)
+
+    # ── SSE Support (non-breaking addition) ───────────────────────────────────
+
+    async def subscribe_async(self, run_id: str, cursor: int = 0) -> list[Event]:
+        """Async-friendly subscription for SSE streaming.
+
+        Returns events since cursor. For true async streaming, use RunGateway's
+        subscribe_events_async which polls this method.
+        """
+        return self.since(cursor)
+
+    def to_sse_message(self, event: Event) -> str:
+        """Convert event to SSE message format.
+
+        Non-breaking addition - used by FastAPI SSE endpoints.
+        """
+        return f"data: {event.model_dump_json()}\n\n"

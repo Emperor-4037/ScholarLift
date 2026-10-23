@@ -6,7 +6,7 @@ Rules are composable; the engine evaluates them all deterministically.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from scholarship_finder.domain.models import EligibilityResult, GapSeverity
@@ -38,7 +38,7 @@ def evaluate_gpa_minimum(
             rule_name=rule_name,
             candidate_value=str(candidate_gpa) if candidate_gpa is not None else None,
             required_value=str(required_gpa) if required_gpa is not None else None,
-            explanation="GPA data missing; cannot evaluate",
+            explanation="GPA requirement not specified",
         )
     met = candidate_gpa >= required_gpa
     margin = round(candidate_gpa - required_gpa, 2)
@@ -47,7 +47,7 @@ def evaluate_gpa_minimum(
         rule_name=rule_name,
         candidate_value=str(candidate_gpa),
         required_value=str(required_gpa),
-        explanation=f"GPA margin: {margin:+.2f}" if met else f"GPA deficit: {margin:.2f}",
+        explanation=f"GPA margin: {margin:+.2f}" if met else f"Below minimum by {abs(margin):.2f}",
         blocking=not met,
     )
 
@@ -201,10 +201,11 @@ def derive_gaps(results: list[RuleResult]) -> list[dict[str, Any]]:
                 "blocking": r.blocking,
             })
         elif r.result == EligibilityResult.UNKNOWN:
+            # Simplified remedy for UNKNOWN cases
             gaps.append({
                 "gap_type": r.rule_name,
                 "description": r.explanation,
-                "remedy": f"Manually verify '{r.rule_name}' against the official program page",
+                "remedy": "Check official page for requirements",
                 "severity": GapSeverity.MEDIUM.value,
                 "blocking": False,
             })
@@ -214,18 +215,9 @@ def derive_gaps(results: list[RuleResult]) -> list[dict[str, Any]]:
 def _remedy_for(r: RuleResult) -> str:
     name = r.rule_name
     if "gpa" in name:
-        return (
-            f"Your GPA ({r.candidate_value}) is below the stated minimum ({r.required_value}). "
-            "Consider programs with a lower threshold or strengthen your application with strong recommendations."
-        )
+        return f"Minimum {r.required_value} required (you have {r.candidate_value})"
     if "language" in name or any(t in name for t in ("ielts", "toefl", "pte")):
-        return (
-            f"Score {r.required_value} required; you have {r.candidate_value}. "
-            "Retake the test or apply to programs that waive English requirements."
-        )
+        return f"Minimum {r.required_value} required (you have {r.candidate_value})"
     if "degree_level" in name:
-        return (
-            f"Program requires {r.required_value}; you are applying from {r.candidate_value}. "
-            "Confirm entry requirements with the admissions office."
-        )
+        return f"Requires {r.required_value} (you have {r.candidate_value})"
     return f"Meet the '{name}' requirement: required {r.required_value}, candidate has {r.candidate_value}."

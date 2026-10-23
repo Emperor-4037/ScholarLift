@@ -14,9 +14,10 @@ Sections:
 from __future__ import annotations
 
 import enum
+import operator
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Annotated, Any, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -275,7 +276,7 @@ class Opportunity(BaseModel):
     funding: Optional[FundingInfo] = None
     deadlines: list[DeadlineInfo] = Field(default_factory=list)
     requirements: list[OpportunityField] = Field(default_factory=list)
-    verification: VerificationResult = Field(default_factory=VerificationResult)
+    verification: VerificationResult = Field(default_factory=lambda: VerificationResult())
 
     def is_existence_verified(self) -> bool:
         return self.verification.existence_verified
@@ -391,9 +392,9 @@ class RunBudgets(BaseModel):
 
 class RunDeadlines(BaseModel):
     """Immutable timing targets; injected at run start."""
-    phase_a_soft_s: float = 75.0   # soft cutoff: stop new fetches
-    phase_a_hard_s: float = 90.0   # hard stop for Phase A
-    phase_b_cap_s: float = 120.0   # Phase B independent deadline
+    phase_a_soft_s: float = 60.0   # soft cutoff: stop new fetches (optimized for speed)
+    phase_a_hard_s: float = 75.0   # hard stop for Phase A (optimized for speed)
+    phase_b_cap_s: float = 45.0    # Phase B independent deadline (optimized for speed)
     started_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     def elapsed_s(self) -> float:
@@ -486,6 +487,9 @@ class SwarmState(BaseModel):
     # Agent 1 output
     profile: Optional[CandidateProfile] = None
 
+    # PIIVault reference for rehydration (stored as vault_id string)
+    vault_reference: str = ""
+
     # Agent 2 output
     search_plans: list[SearchPlan] = Field(default_factory=list)
     candidates: list[Candidate] = Field(default_factory=list)
@@ -493,6 +497,10 @@ class SwarmState(BaseModel):
     # Agent 3 output
     opportunities: list[Opportunity] = Field(default_factory=list)
     diagnostics: list[DiagnosticEntry] = Field(default_factory=list)
+
+    # Temporary field for Send API mapper aggregation (Phase 2.1)
+    # Uses operator.add reducer to aggregate results from parallel mappers
+    verified_opps: Annotated[list[Opportunity], operator.add] = Field(default_factory=list)
 
     # Agent 4 output
     assessments: list[EligibilityAssessment] = Field(default_factory=list)

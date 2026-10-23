@@ -5,7 +5,6 @@ The composition root reads Settings once at startup and wires adapters from it.
 """
 from __future__ import annotations
 
-import os
 from enum import Enum
 from functools import lru_cache
 from typing import Annotated
@@ -54,8 +53,8 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
 
     # Ordered comma-separated model IDs; first = highest preference
-    tier_fast_chain: str = "gemini-3.5-flash-lite,gemini-flash-lite-latest"
-    tier_reasoning_chain: str = "gemini-3.5-flash"
+    tier_fast_chain: str = "gemini-3.5-flash-lite,gemini-3.6-flash"
+    tier_reasoning_chain: str = "gemini-3.6-flash"
     tier_vision_chain: str = "gemini-3.5-flash"
 
     # Hard cap from DEC-1: ≤4 reasoning calls per run
@@ -80,6 +79,23 @@ class Settings(BaseSettings):
 
     # ── Privacy ────────────────────────────────────────────────────────────
     pii_vault_ttl_seconds: Annotated[int, Field(ge=60, le=3600)] = 900
+
+    # ── Phase Timing (speed vs quality tradeoff) ───────────────────────────
+    # Lower values = faster execution, potentially fewer opportunities
+    # Higher values = more thorough search, slower execution
+    phase_a_soft_deadline_s: Annotated[float, Field(ge=30.0, le=600.0)] = 90.0
+    phase_a_hard_deadline_s: Annotated[float, Field(ge=30.0, le=600.0)] = 120.0
+    phase_b_deadline_s: Annotated[float, Field(ge=30.0, le=600.0)] = 90.0
+
+    # ── OCR Configuration ───────────────────────────────────────────────────
+    enable_ocr: bool = True  # Enable OCR fallback for scanned PDFs
+    ocr_threshold_chars: Annotated[int, Field(ge=10, le=200)] = 50  # Chars below which OCR triggers
+    ocr_max_pages: Annotated[int, Field(ge=1, le=50)] = 20  # Max pages to OCR per PDF (cost control)
+
+    # ── API Configuration ─────────────────────────────────────────────────────
+    api_host: str = "0.0.0.0"
+    api_port: int = 8000
+    api_reload: bool = True  # Auto-reload in development
 
     # ── Document ───────────────────────────────────────────────────────────
     pdf_backend: PDFBackend = PDFBackend.PYMUPDF

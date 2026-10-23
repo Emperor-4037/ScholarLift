@@ -5,7 +5,6 @@ Uses only `urllib.parse` — no external dependencies.
 from __future__ import annotations
 
 import ipaddress
-import urllib.parse
 from urllib.parse import urlparse, urlunparse, urlencode, parse_qsl
 
 # Query-string parameters that carry no information value and should be stripped

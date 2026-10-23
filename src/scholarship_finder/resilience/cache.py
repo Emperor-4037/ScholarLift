@@ -7,6 +7,11 @@ Three independent caches (architecture §2.1, §3.7):
 
 Cross-run caches hold only public web data — never candidate data.
 Cache can be bypassed via a per-request flag for the 'Force Live Refresh' toggle.
+
+Request-scoped cache (Phase 1 optimization):
+  - Per-run cache for duplicate lookups within single request
+  - Cleared at end of each run
+  - Helps reduce API calls for repeated operations
 """
 from __future__ import annotations
 
@@ -59,6 +64,48 @@ class TTLCache:
         return len(self._store)
 
 
+class RequestCache:
+    """Request-scoped cache for duplicate lookups within a single run.
+
+    Unlike TTLCache, this cache is cleared at the end of each run.
+    Used for caching results that may be reused multiple times within the same pipeline execution,
+    such as GitHub profiles, search results, or fetch results.
+
+    Args:
+        maxsize:  Maximum number of entries before oldest is evicted.
+    """
+
+    def __init__(self, maxsize: int = 128) -> None:
+        self.maxsize = maxsize
+        self._store: OrderedDict[str, Any] = OrderedDict()
+
+    def get(self, key: str) -> Any | None:
+        """Return cached value or None if missing."""
+        if key not in self._store:
+            return None
+        # Move to end (LRU)
+        self._store.move_to_end(key)
+        return self._store[key]
+
+    def set(self, key: str, value: Any) -> None:
+        """Store *value* under *key*."""
+        if key in self._store:
+            self._store.move_to_end(key)
+        self._store[key] = value
+        while len(self._store) > self.maxsize:
+            self._store.popitem(last=False)  # evict oldest
+
+    def invalidate(self, key: str) -> None:
+        self._store.pop(key, None)
+
+    def clear(self) -> None:
+        """Clear all entries (called at end of run)."""
+        self._store.clear()
+
+    def __len__(self) -> int:
+        return len(self._store)
+
+
 def make_search_key(query_text: str) -> str:
     """Normalize and hash a search query for cache keying."""
     normalized = " ".join(query_text.lower().split())
@@ -81,6 +128,7 @@ def make_content_hash(text: str) -> str:
 _search_cache = TTLCache(maxsize=256, ttl_s=4 * 3600)    # 4 hours
 _fetch_cache = TTLCache(maxsize=512, ttl_s=4 * 3600)     # 4 hours
 _extract_cache = TTLCache(maxsize=256, ttl_s=8 * 3600)   # 8 hours
+_github_cache = TTLCache(maxsize=128, ttl_s=24 * 3600)   # 24 hours (GitHub data relatively stable)
 
 
 def get_search_cache() -> TTLCache:
@@ -93,6 +141,10 @@ def get_fetch_cache() -> TTLCache:
 
 def get_extract_cache() -> TTLCache:
     return _extract_cache
+
+
+def get_github_cache() -> TTLCache:
+    return _github_cache
 
 
 def clear_all_caches() -> None:

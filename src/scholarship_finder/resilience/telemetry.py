@@ -77,10 +77,14 @@ def telemetry_wrap(
             output_tokens: int = int(kwargs.get("_output_tokens", 0))
             reasoning_tokens: int = int(kwargs.get("_reasoning_tokens", 0))
 
+            # Convert tier string to LLMTier enum
+            from scholarship_finder.domain.models import LLMTier
+            tier_enum = LLMTier(tier) if isinstance(tier, str) else tier
+
             record = UsageRecord(
                 provider=provider,
                 model=model,
-                tier=tier,
+                tier=tier_enum,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 reasoning_tokens=reasoning_tokens,

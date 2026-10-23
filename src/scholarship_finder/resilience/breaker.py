@@ -13,7 +13,6 @@ from __future__ import annotations
 import asyncio
 import time
 from enum import Enum
-from typing import Callable
 
 from scholarship_finder.errors import (
     AuthError,
@@ -121,12 +120,15 @@ class CircuitBreaker:
         if self._state == BreakerState.KNOWN_EXHAUSTED and not self._exhausted_permanent:
             import datetime
             now = datetime.datetime.now(datetime.timezone.utc)
+            current_hour = now.hour
             # Simple heuristic: if current UTC hour >= reset hour and we've been exhausted
             # for more than 1 hour, assume the quota has rolled over.
             if self._opened_at and (time.monotonic() - self._opened_at) > 3600:
-                self._state = BreakerState.CLOSED
-                self._consecutive_failures = 0
-                self._opened_at = None
+                # Only reset if we've passed the reset hour since opening
+                if current_hour >= self.quota_reset_hour:
+                    self._state = BreakerState.CLOSED
+                    self._consecutive_failures = 0
+                    self._opened_at = None
 
 
 class BreakerRegistry:

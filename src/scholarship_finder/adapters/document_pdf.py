@@ -103,13 +103,26 @@ class PDFDocumentAdapter(DocumentPort):
 
     Falls back to the secondary backend automatically if the primary raises.
     Implements the DocumentPort protocol.
+    Optionally uses OCR adapter for scanned PDFs.
     """
 
-    def __init__(self, backend: str | None = None) -> None:
+    def __init__(
+        self,
+        backend: str | None = None,
+        ocr_adapter: Any = None,
+        ocr_threshold: int = 50,
+    ) -> None:
         cfg = get_settings()
-        raw = backend or getattr(cfg, "pdf_backend", "pymupdf")
+        raw = backend or getattr(cfg, "pdf_backend", "pymupdf") or "pymupdf"
         self._backend = _PDFBackend(raw.lower())
-        logger.debug("PDFDocumentAdapter using backend=%s", self._backend)
+        self._ocr_adapter = ocr_adapter
+        self._ocr_threshold = ocr_threshold
+        logger.debug(
+            "PDFDocumentAdapter using backend=%s, ocr_enabled=%s, ocr_threshold=%d",
+            self._backend,
+            ocr_adapter is not None,
+            ocr_threshold,
+        )
 
     # ------------------------------------------------------------------
     # DocumentPort interface
@@ -174,18 +187,91 @@ class PDFDocumentAdapter(DocumentPort):
             backend_used,
         )
 
+        # OCR fallback for low-char pages if OCR adapter is available
+        ocr_used = False
+        ocr_backend = ""
+        ocr_confidence = 0.0
+
+        if self._ocr_adapter and is_scanned:
+            # Find pages with < threshold chars
+            low_char_pages = [p for p in pages if p.char_count < self._ocr_threshold]
+
+            if low_char_pages:
+                logger.info(
+                    "OCR: %d pages below threshold (%d chars), attempting OCR",
+                    len(low_char_pages),
+                    self._ocr_threshold,
+                )
+
+                # Render function for PyMuPDF
+                def render_pymupdf_page(pdf_data: bytes, page_idx: int) -> bytes:
+                    import fitz
+                    doc = fitz.open(stream=pdf_data, filetype="pdf")
+                    try:
+                        page = doc[page_idx]
+                        # Render to PNG at 150 DPI
+                        pix = page.get_pixmap(dpi=150)
+                        img_bytes = pix.tobytes("png")
+                        return img_bytes
+                    finally:
+                        doc.close()
+
+                # Render function for pypdf (fallback - less common since pypdf doesn't render well)
+                def render_pypdf_page(pdf_data: bytes, page_idx: int) -> bytes:
+                    # pypdf doesn't have good rendering capabilities
+                    # Return empty bytes to indicate failure
+                    raise NotImplementedError("pypdf rendering not supported for OCR")
+
+                # Choose render function based on backend
+                render_fn = render_pymupdf_page if backend_used == "pymupdf" else render_pypdf_page
+
+                try:
+                    ocr_results = await self._ocr_adapter.ocr_pdf(
+                        pdf_bytes,
+                        [p.page_number - 1 for p in low_char_pages],  # Convert to 0-indexed
+                        render_fn,
+                    )
+
+                    # Update pages with OCR text
+                    for page in pages:
+                        if page.page_number in ocr_results:
+                            old_text = page.text
+                            page.text = ocr_results[page.page_number]
+                            page.char_count = len(page.text)
+                            logger.debug(
+                                "OCR: Page %d updated: %d -> %d chars",
+                                page.page_number,
+                                len(old_text),
+                                len(page.text),
+                            )
+
+                    ocr_used = True
+                    ocr_backend = self._ocr_adapter.capabilities().get("vision_model", "unknown")
+                    ocr_confidence = 0.8  # Placeholder - could be enhanced with actual confidence
+
+                    # Re-evaluate scanned status after OCR
+                    scanned_count = sum(1 for p in pages if p.char_count < _SCANNED_CHAR_THRESHOLD)
+                    is_scanned = len(pages) > 0 and scanned_count > len(pages) * 0.5
+
+                except Exception as exc:
+                    logger.warning("OCR: Failed to apply OCR: %s", exc)
+
         return DocumentResult(
             pages=pages,
             total_pages=len(pages),
             is_scanned=is_scanned,
             backend_used=backend_used,
+            ocr_used=ocr_used,
+            ocr_backend=ocr_backend,
+            ocr_confidence=ocr_confidence,
         )
 
     def capabilities(self) -> dict[str, Any]:
         return {
-            "ocr_capable": False,  # Pure text extraction; vision tier handles OCR
+            "ocr_capable": self._ocr_adapter is not None,
             "max_file_bytes": _MAX_BYTES,
             "backend": self._backend.value,
             "fallback_backend": "pypdf" if self._backend == _PDFBackend.PYMUPDF else "pymupdf",
             "scanned_detection": True,
+            "ocr_threshold": self._ocr_threshold,
         }

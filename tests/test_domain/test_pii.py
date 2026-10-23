@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from scholarship_finder.domain.pii import PIIScrubber, PIIVault, scrub_text
+from scholarship_finder.domain.pii import PIIScrubber, PIIVault, _GITHUB_URL_RE, scrub_text
 
 
 class TestPIIVault:
@@ -108,3 +108,53 @@ class TestScrubTextConvenience:
         result = scrub_text("My name is Rahul Sharma", "Rahul Sharma", sample_vault)
         assert "Rahul Sharma" not in result
         assert "[CANDIDATE_NAME]" in result
+
+
+class TestGitHubURLRegex:
+    def test_matches_single_segment_url(self):
+        """Test that regex matches simple GitHub profile URLs (single segment)."""
+        text = "Check my profile at https://github.com/johndoe"
+        matches = _GITHUB_URL_RE.findall(text)
+        assert len(matches) == 1
+        assert "johndoe" in matches[0]
+
+    def test_matches_double_segment_url(self):
+        """Test that regex matches org repository URLs (double segment)."""
+        text = "Repository at https://github.com/orgname/reponame"
+        matches = _GITHUB_URL_RE.findall(text)
+        assert len(matches) == 1
+        assert "orgname" in matches[0]
+        assert "reponame" in matches[0]
+
+    def test_matches_with_www(self):
+        """Test that regex matches URLs with www prefix."""
+        text = "Visit https://www.github.com/username"
+        matches = _GITHUB_URL_RE.findall(text)
+        assert len(matches) == 1
+        assert "username" in matches[0]
+
+    def test_matches_case_insensitive(self):
+        """Test that regex is case-insensitive for GitHub.com."""
+        text = "Check GITHUB.COM/username at https://GITHUB.COM/username"
+        matches = _GITHUB_URL_RE.findall(text)
+        assert len(matches) == 1
+
+    def test_matches_hyphenated_username(self):
+        """Test that regex matches usernames with hyphens."""
+        text = "Profile: https://github.com/john-doe-123"
+        matches = _GITHUB_URL_RE.findall(text)
+        assert len(matches) == 1
+        assert "john-doe-123" in matches[0]
+
+    def test_does_not_match_without_second_segment_optional(self):
+        """Test that regex correctly handles missing second segment."""
+        text = "My GitHub is https://github.com/username"
+        matches = _GITHUB_URL_RE.findall(text)
+        assert len(matches) == 1
+        assert "username" in matches[0]
+
+    def test_matches_multiple_urls(self):
+        """Test that regex finds all GitHub URLs in text."""
+        text = "Check https://github.com/user1 and https://github.com/org/repo"
+        matches = _GITHUB_URL_RE.findall(text)
+        assert len(matches) == 2

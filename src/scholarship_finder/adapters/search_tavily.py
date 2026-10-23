@@ -6,7 +6,6 @@ All errors mapped to normalized taxonomy.
 """
 from __future__ import annotations
 
-import time
 from typing import Any
 
 from scholarship_finder.errors import (
@@ -17,7 +16,7 @@ from scholarship_finder.errors import (
     TransientError,
     UnknownAdapterError,
 )
-from scholarship_finder.ports.search import SearchPort, SearchQuery, SearchResult, SearchResultItem
+from scholarship_finder.ports.search import SearchQuery, SearchResult, SearchResultItem
 
 try:
     from tavily import TavilyClient, InvalidAPIKeyError, MissingAPIKeyError, UsageLimitExceededError

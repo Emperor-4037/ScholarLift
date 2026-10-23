@@ -8,16 +8,12 @@ Responsibilities (architecture §1.2, §3.1):
 - `get_snapshot()`    — current SwarmState for the "Top-5 cards" render
 - `cancel()`          — graceful cancellation; emits FAILED_SAFE terminal event
 
-## Concurrency model (LITE profile, Streamlit-safe)
+## Concurrency model
 
-Streamlit reruns the script on every user interaction.  Any ``asyncio.Task``
-created on Streamlit's script-runner event loop is **paused** between reruns,
-so it never receives CPU time to advance.
-
-The fix is to run the pipeline in a completely independent OS thread:
+The pipeline runs in a completely independent OS thread to avoid event loop conflicts:
 
     ┌──────────────────────────────────────────────────────────────┐
-    │  Streamlit Script Thread                                     │
+    │  Main Thread (FastAPI / Web UI)                             │
     │  (reads EventBus / SwarmState via thread-safe primitives)   │
     └─────────────────────────┬────────────────────────────────────┘
                               │ polling (no await)
@@ -41,6 +37,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from scholarship_finder.config import get_settings
+from scholarship_finder.domain.pii import PIIVault
 from scholarship_finder.domain.models import (
     Event,
     EventKind,
@@ -55,6 +52,41 @@ from scholarship_finder.domain.models import (
 from scholarship_finder.engine.event_bus import EventBus
 
 logger = logging.getLogger(__name__)
+
+
+# ── Vault Registry ─────────────────────────────────────────────────────────────
+
+class VaultRegistry:
+    """Thread-safe registry for active PIIVault instances.
+    
+    Allows vaults to be accessed after the graph runner completes,
+    enabling rehydration of [CANDIDATE_NAME] placeholders in the SOP.
+    """
+    def __init__(self):
+        self._vaults: dict[str, PIIVault] = {}
+        self._lock = threading.Lock()
+    
+    def register(self, vault: PIIVault) -> None:
+        """Register a vault instance for later retrieval."""
+        with self._lock:
+            self._vaults[vault.vault_id] = vault
+    
+    def get(self, vault_id: str) -> PIIVault | None:
+        """Retrieve a vault by ID, returning None if expired or not found."""
+        with self._lock:
+            vault = self._vaults.get(vault_id)
+            if vault and vault.is_expired:
+                del self._vaults[vault_id]
+                return None
+            return vault
+    
+    def cleanup_expired(self) -> None:
+        """Remove all expired vaults from the registry."""
+        with self._lock:
+            expired = [vid for vid, v in self._vaults.items() if v.is_expired]
+            for vid in expired:
+                del self._vaults[vid]
+                logger.debug("VaultRegistry: cleaned up expired vault %s", vid)
 
 
 @dataclass
@@ -82,14 +114,18 @@ class RunHandle:
 
 
 class RunGateway:
-    """In-process adapter (LITE profile) that drives the LangGraph engine.
+    """In-process adapter that drives the LangGraph engine.
 
     One ``RunGateway`` instance is created at application startup and shared
-    across all Streamlit sessions (via ``@st.cache_resource``).
+    across all sessions.
 
     All public methods that mutate ``_runs`` are protected by a
-    ``threading.Lock`` — safe to call from the Streamlit script thread.
+    ``threading.Lock`` — safe to call from any thread.
     """
+
+    # Dynamic attributes set by composition.py
+    intake_service: Any = None
+    make_graph_runner: Any = None
 
     def __init__(
         self,
@@ -101,6 +137,7 @@ class RunGateway:
         self._graph_runner = graph_runner
         self._runs: dict[str, RunHandle] = {}
         self._lock = threading.Lock()           # guards _runs dict mutations
+        self.vault_registry = VaultRegistry()  # registry for PIIVault instances
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -136,7 +173,7 @@ class RunGateway:
         """
         with self._lock:
             active = sum(1 for h in self._runs.values() if not h.finished)
-            if active >= self._max_concurrent:
+            if self._max_concurrent is not None and active >= self._max_concurrent:
                 raise RuntimeError(
                     f"Maximum concurrent runs ({self._max_concurrent}) reached. "
                     "Please wait for an active run to complete."
@@ -238,6 +275,34 @@ class RunGateway:
             for h in self._runs.values()
         ]
 
+    # ── SSE Support (non-breaking addition) ─────────────────────────────────
+
+    async def subscribe_events_async(self, run_id: str, cursor: int = 0):
+        """Async generator for SSE streaming.
+
+        Non-breaking addition - used by FastAPI SSE endpoints.
+        Yields SSE-formatted messages as strings.
+        """
+        import json
+        import asyncio
+
+        handle = self._runs.get(run_id)
+        if not handle:
+            # Yield error message and stop
+            yield f"data: {json.dumps({'type': 'error', 'message': 'Run not found'})}\n\n"
+            return
+
+        while not handle.finished:
+            new_events = handle.bus.since(cursor)
+            if new_events:
+                cursor = new_events[-1].seq
+                for event in new_events:
+                    yield handle.bus.to_sse_message(event)
+            await asyncio.sleep(0.5)  # Poll interval for SSE
+
+        # Send final completion event
+        yield f"data: {json.dumps({'type': 'complete', 'run_id': run_id})}\n\n"
+
     # ── Internal ──────────────────────────────────────────────────────────────
 
     def _run_in_thread(
@@ -335,15 +400,21 @@ class RunGateway:
 
 def make_initial_state(run_id: str | None = None) -> SwarmState:
     """Create a blank SwarmState for a new run with defaults."""
+    cfg = get_settings()
     rid = run_id or str(uuid.uuid4())
     return SwarmState(
         run_meta=RunMeta(
             run_id=rid,
             phase=RunPhase.INTAKE,
-            deadlines=RunDeadlines(started_at=datetime.now(timezone.utc)),
+            deadlines=RunDeadlines(
+                started_at=datetime.now(timezone.utc),
+                phase_a_soft_s=cfg.phase_a_soft_deadline_s,
+                phase_a_hard_s=cfg.phase_a_hard_deadline_s,
+                phase_b_cap_s=cfg.phase_b_deadline_s,
+            ),
             budgets=RunBudgets(
-                fast_calls_remaining=200,
-                search_credits_remaining=50,
+                fast_calls_limit=100,  # Reduced from 200 for token efficiency
+                search_credits_limit=30,  # Reduced from 50 for token efficiency
             ),
         )
     )

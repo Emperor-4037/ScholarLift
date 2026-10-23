@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from scholarship_finder.errors import QuotaExhaustedError, RateLimitedError, RateLimitScope
 

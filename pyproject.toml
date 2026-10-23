@@ -12,7 +12,6 @@ dependencies = [
     "pydantic>=2.9",
     "pydantic-settings>=2.5",
     "langgraph>=0.3",
-    "streamlit>=1.40",
     "pymupdf>=1.25",
     "pypdf>=5.0",
     "httpx>=0.28",
@@ -21,18 +20,23 @@ dependencies = [
     "tavily-python>=0.5",
     "python-dotenv>=1.0",
     "trafilatura>=1.12",          # local main-content extraction (Tier 2 fetch)
-    "fastapi>=0.115",              # optional FULL-profile SSE transport
+    "fastapi>=0.115",              # SSE transport
     "uvicorn[standard]>=0.32",
     "aiofiles>=24.1",
     "anyio>=4.6",
+    "jinja2>=3.1.0",              # HTML templates for FastAPI UI
 ]
 
 [project.scripts]
+scholarship-run = "scholarship_finder.cli:main"
 scholarship-preflight = "scholarship_finder.preflight:__main__"
 
 [project.optional-dependencies]
 full = [
     "playwright>=1.49",           # Tier-3 headless browser (FULL profile only)
+]
+ocr = [
+    "pillow>=10.0.0",            # Image processing for OCR (optional, pymupdf has built-in rendering)
 ]
 dev = [
     "pytest>=8.0",

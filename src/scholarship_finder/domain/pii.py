@@ -51,6 +51,13 @@ _PASSPORT_RE = re.compile(r"\b[A-Z]{1,2}\d{7,8}\b")
 # SSN-like: NNN-NN-NNNN
 _SSN_RE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
 
+# GitHub URLs: github.com/username or github.com/org/username
+# Matches both single-segment (user profile) and double-segment (org repository) URLs
+_GITHUB_URL_RE = re.compile(
+    r"https?://(?:www\.)?github\.com/[\w\-]+(?:/[\w\-]+)?",
+    re.IGNORECASE,
+)
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # PIIVault

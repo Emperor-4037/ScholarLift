@@ -164,57 +164,89 @@ def reduce_opportunities(
     For each field in the incoming opportunity:
       - If the current record has that field as EVIDENCED, skip the incoming value.
       - Otherwise, update.
-    """
-    merged: dict[str, Opportunity] = {o.id: o for o in current}
 
+    Additionally, deduplicates by official_url to prevent duplicate opportunities
+    with different IDs from the same URL.
+    """
+    # First, deduplicate by official_url to prevent same-URL duplicates
+    url_deduped: dict[str, Opportunity] = {}
+
+    # Process current opportunities
+    for opp in current:
+        url = opp.official_url
+        if url and url not in url_deduped:
+            url_deduped[url] = opp
+        elif url:
+            # Keep the one with higher completeness_score
+            existing = url_deduped[url]
+            if opp.verification.completeness_score > existing.verification.completeness_score:
+                url_deduped[url] = opp
+
+    # Process new opportunities
+    for opp in new_opps:
+        url = opp.official_url
+        if url and url not in url_deduped:
+            url_deduped[url] = opp
+        elif url:
+            # Keep the one with higher completeness_score
+            existing = url_deduped[url]
+            if opp.verification.completeness_score > existing.verification.completeness_score:
+                url_deduped[url] = opp
+
+    # Now merge by ID for field promotion (EVIDENCED protection)
+    # Build initial map from deduped opportunities
+    merged: dict[str, Opportunity] = {o.id: o for o in url_deduped.values()}
+
+    # Process new opportunities and merge with existing ones by ID
     for incoming in new_opps:
         if incoming.id not in merged:
+            # New opportunity - add it
             merged[incoming.id] = incoming
-            continue
+        else:
+            # Existing opportunity - merge fields
+            existing = merged[incoming.id]
+            existing_data = existing.model_dump()
 
-        existing = merged[incoming.id]
-        existing_data = existing.model_dump()
+            # Merge top-level scalar fields
+            for scalar in ("name", "institution_or_funder", "country", "degree_level", "official_url"):
+                inc_val = getattr(incoming, scalar)
+                if inc_val and not getattr(existing, scalar):
+                    existing_data[scalar] = inc_val
 
-        # Merge top-level scalar fields
-        for scalar in ("name", "institution_or_funder", "country", "degree_level", "official_url"):
-            inc_val = getattr(incoming, scalar)
-            if inc_val and not getattr(existing, scalar):
-                existing_data[scalar] = inc_val
+            # Merge field list: EVIDENCED never overwritten by UNVERIFIED
+            existing_fields_map: dict[str, dict] = {
+                f["field_name"]: f for f in existing_data["fields"]
+            }
+            for inc_field in incoming.fields:
+                fname = inc_field.field_name
+                if fname in existing_fields_map:
+                    ex = existing_fields_map[fname]
+                    if (
+                        ex["status"] == FieldStatus.EVIDENCED
+                        and inc_field.status != FieldStatus.EVIDENCED
+                    ):
+                        continue  # protect EVIDENCED
+                existing_fields_map[fname] = inc_field.model_dump()
+            existing_data["fields"] = list(existing_fields_map.values())
 
-        # Merge field list: EVIDENCED never overwritten by UNVERIFIED
-        existing_fields_map: dict[str, dict] = {
-            f["field_name"]: f for f in existing_data["fields"]
-        }
-        for inc_field in incoming.fields:
-            fname = inc_field.field_name
-            if fname in existing_fields_map:
-                ex = existing_fields_map[fname]
-                if (
-                    ex["status"] == FieldStatus.EVIDENCED
-                    and inc_field.status != FieldStatus.EVIDENCED
-                ):
-                    continue  # protect EVIDENCED
-            existing_fields_map[fname] = inc_field.model_dump()
-        existing_data["fields"] = list(existing_fields_map.values())
+            # Merge verification: prefer higher completeness_score
+            if incoming.verification.completeness_score > existing.verification.completeness_score:
+                existing_data["verification"] = incoming.verification.model_dump()
 
-        # Merge verification: prefer higher completeness_score
-        if incoming.verification.completeness_score > existing.verification.completeness_score:
-            existing_data["verification"] = incoming.verification.model_dump()
+            # Merge funding if incoming is better
+            if incoming.funding and (
+                not existing.funding
+                or incoming.funding.status == FieldStatus.EVIDENCED
+            ):
+                existing_data["funding"] = incoming.funding.model_dump()
 
-        # Merge funding if incoming is better
-        if incoming.funding and (
-            not existing.funding
-            or incoming.funding.status == FieldStatus.EVIDENCED
-        ):
-            existing_data["funding"] = incoming.funding.model_dump()
+            # Append new deadlines
+            existing_deadline_descs = {d.description for d in existing.deadlines}
+            for dl in incoming.deadlines:
+                if dl.description not in existing_deadline_descs:
+                    existing_data["deadlines"].append(dl.model_dump())
 
-        # Append new deadlines
-        existing_deadline_descs = {d.description for d in existing.deadlines}
-        for dl in incoming.deadlines:
-            if dl.description not in existing_deadline_descs:
-                existing_data["deadlines"].append(dl.model_dump())
-
-        merged[incoming.id] = Opportunity.model_validate(existing_data)
+            merged[incoming.id] = Opportunity.model_validate(existing_data)
 
     return list(merged.values())
 

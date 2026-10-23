@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Scholarship Finder</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🎓 AI Scholarship Finder</h1>
+            <p class="subtitle">Autonomous Multi-Agent AI Scholarship Discovery</p>
+        </header>
+
+        <main>
+            <!-- Upload Section -->
+            <section id="upload-section" class="card">
+                <h2>Upload Your Resume</h2>
+                <form id="upload-form">
+                    <div class="form-group">
+                        <label for="resume">Resume (PDF, TXT, MD)</label>
+                        <input type="file" id="resume" accept=".pdf,.txt,.md" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="display-name">Display Name (optional)</label>
+                        <input type="text" id="display-name" placeholder="Your name">
+                    </div>
+                    <div class="form-group">
+                        <label for="github">GitHub Username (optional)</label>
+                        <input type="text" id="github" placeholder="your-username">
+                    </div>
+                    <div class="form-group checkbox">
+                        <input type="checkbox" id="force-refresh">
+                        <label for="force-refresh">Force Live Refresh (bypass cache)</label>
+                    </div>
+                    <button type="submit" class="btn btn-primary">Analyze</button>
+                </form>
+            </section>
+
+            <!-- Progress Section -->
+            <section id="progress-section" class="card hidden">
+                <h2>Analysis Progress</h2>
+                <div id="telemetry-log" class="telemetry"></div>
+                <div class="progress-bar">
+                    <div id="progress-fill" class="progress-fill"></div>
+                </div>
+            </section>
+
+            <!-- Results Section -->
+            <section id="results-section" class="card hidden">
+                <h2>Your Profile</h2>
+                <div id="profile-container" class="profile-container">
+                    <div id="profile-summary" class="profile-summary"></div>
+                    <div id="enrichment-tips" class="enrichment-tips"></div>
+                </div>
+
+                <h2 id="opportunities-heading">Top Opportunities</h2>
+                <div id="opportunities-grid" class="opportunities-grid"></div>
+
+                <h2>Statement of Purpose</h2>
+                <div id="sop-container" class="sop-container">
+                    <div id="sop-text" class="sop-text"></div>
+                    <button id="download-sop" class="btn btn-secondary">Download SOP</button>
+                </div>
+            </section>
+        </main>
+
+        <footer>
+            <button id="clear-data" class="btn btn-danger">Clear My Data</button>
+        </footer>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>

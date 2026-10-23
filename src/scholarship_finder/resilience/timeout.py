@@ -78,7 +78,7 @@ def timeout_wrap(
     label:
         Descriptive label for error messages; defaults to ``fn.__name__``.
     """
-    _label = label or getattr(fn, "__name__", "unknown")
+    _label = str(label or getattr(fn, "__name__", "unknown"))
 
     async def _wrapper(*args: Any, **kwargs: Any) -> _T:
         return await with_timeout(fn(*args, **kwargs), seconds=seconds, label=_label)

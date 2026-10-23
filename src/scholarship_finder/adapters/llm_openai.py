@@ -24,7 +24,7 @@ from scholarship_finder.errors import (
     TransientError,
     UnknownAdapterError,
 )
-from scholarship_finder.ports.llm import LLMPort, LLMResult, LLMUsage, TaskSpec
+from scholarship_finder.ports.llm import LLMResult, LLMUsage, TaskSpec
 
 try:
     from openai import AsyncOpenAI, APIStatusError, APIConnectionError, APITimeoutError
@@ -86,6 +86,7 @@ class OpenAICompatAdapter:
         tier:         Logical tier this adapter serves.
         may_train:    Whether the provider may use prompts for training.
         supports_json_schema: Whether the endpoint supports strict JSON schema output.
+        bus:          Optional EventBus for error reporting.
     """
 
     def __init__(
@@ -96,6 +97,7 @@ class OpenAICompatAdapter:
         tier: LLMTier,
         may_train: bool = False,
         supports_json_schema: bool = True,
+        bus=None,
     ) -> None:
         if not _OPENAI_AVAILABLE:
             raise ImportError("openai package not installed. Run: pip install openai")
@@ -104,6 +106,7 @@ class OpenAICompatAdapter:
         self._may_train = may_train
         self._supports_json = supports_json_schema
         self._client = AsyncOpenAI(api_key=api_key, base_url=base_url or None)
+        self._bus = bus  # Optional EventBus for error reporting
 
     async def complete(self, spec: TaskSpec) -> LLMResult:
         messages = self._build_messages(spec)
@@ -126,7 +129,28 @@ class OpenAICompatAdapter:
         try:
             response = await self._client.chat.completions.create(**kwargs)
         except Exception as exc:
-            raise _map_error(exc, self._model_id) from exc
+            mapped_error = _map_error(exc, self._model_id)
+            # Publish error event if EventBus is available
+            if self._bus:
+                from scholarship_finder.domain.models import Event, EventKind, EventSeverity
+                from datetime import datetime, timezone
+                try:
+                    await self._bus.publish(Event(
+                        run_id=spec.data_blocks[0].get("run_id", "unknown") if spec.data_blocks else "unknown",
+                        seq=0,
+                        timestamp=datetime.now(timezone.utc),
+                        node="llm_openai",
+                        severity=EventSeverity.ERROR,
+                        kind=EventKind.ERROR,
+                        payload={
+                            "model": self._model_id,
+                            "error_type": type(mapped_error).__name__,
+                            "message": str(mapped_error),
+                        }
+                    ))
+                except Exception:
+                    pass  # Don't let event publishing fail the LLM call
+            raise mapped_error from exc
 
         latency_ms = (time.monotonic() - t0) * 1000
         return self._parse_response(response, spec, latency_ms)
@@ -134,16 +158,19 @@ class OpenAICompatAdapter:
     async def stream(self, spec: TaskSpec) -> AsyncIterator[str]:
         messages = self._build_messages(spec)
         try:
-            async with self._client.chat.completions.stream(
+            stream = self._client.chat.completions.create(
                 model=self._model_id,
                 messages=messages,
                 max_tokens=spec.max_output_tokens,
                 temperature=spec.temperature,
-            ) as stream:
-                async for chunk in stream:
-                    delta = chunk.choices[0].delta.content if chunk.choices else None
-                    if delta:
-                        yield delta
+                stream=True,
+            )
+            async for chunk in stream:
+                try:
+                    if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+                        yield chunk.choices[0].delta.content
+                except (AttributeError, IndexError):
+                    pass
         except Exception as exc:
             raise _map_error(exc, self._model_id) from exc
         yield ""  # sentinel
@@ -200,9 +227,10 @@ class OpenAICompatAdapter:
 class OpenAILLMAdapter:
     """Multi-tier LLM adapter wrapping OpenAI-compatible endpoints (Groq, OpenRouter, etc.)."""
 
-    def __init__(self, api_key: str, settings: Any = None) -> None:
+    def __init__(self, api_key: str, settings: Any = None, bus=None) -> None:
         self._api_key = api_key
         self._settings = settings
+        self._bus = bus  # Optional EventBus for error reporting
         base_url = (
             getattr(settings, "groq_api_base_url", "")
             or getattr(settings, "openai_api_base_url", "")
@@ -245,6 +273,7 @@ class OpenAILLMAdapter:
                 base_url=self._base_url,
                 model_id=model,
                 tier=tier,
+                bus=self._bus,
             )
         return self._adapters[cache_key]
 

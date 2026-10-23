@@ -55,17 +55,15 @@ from scholarship_finder.ports.llm import LLMPort, TaskSpec
 logger = logging.getLogger(__name__)
 
 _ALIGNMENT_PROMPT = """\
-You are a graduate admissions expert. For each opportunity below, score how \
-well the candidate's academic background aligns with the opportunity's field \
-of study, on a scale of 0.0 to 1.0.
+You are a graduate admissions expert. For each opportunity below, score field alignment (0.0-1.0) and provide a rationale (max 4 lines, 40 words).
 
 Return ONLY valid JSON array (no markdown):
 [
-  {{"opportunity_id": "<id>", "field_alignment": <float 0.0-1.0>, "rationale": "<1 sentence>"}},
+  {{"opportunity_id": "<id>", "field_alignment": <float 0.0-1.0>, "rationale": "<concise rationale>"}},
   ...
 ]
 
-Candidate fields of interest: {candidate_fields}
+Candidate fields: {candidate_fields}
 Candidate skills: {candidate_skills}
 
 Opportunities:
@@ -103,7 +101,7 @@ class RankingStrategistAgent:
         rule_results_by_opp = self._evaluate_eligibility(profile, opportunities)
 
         # ── Step 2: ONE reasoning-tier alignment call (batched) ───────────────
-        alignment_scores = await self._get_alignment_scores(profile, opportunities, run_id)
+        alignment_scores, alignment_rationales = await self._get_alignment_scores(profile, opportunities, run_id)
 
         # ── Step 3: Weighted scoring ──────────────────────────────────────────
         scored: list[tuple[str, CompositeScore]] = []
@@ -130,12 +128,14 @@ class RankingStrategistAgent:
             scored.append((opp.id, score))
 
         # ── Step 4: Rank and select top-5 ────────────────────────────────────
-        ranked = rank_opportunities(scored)
+        # Build URL mapping for diversity check
+        opp_urls = {opp.id: opp.official_url for opp in opportunities}
+        ranked = rank_opportunities(scored, opp_urls=opp_urls)
         top_5_ids = [opp_id for opp_id, _, _ in ranked[:5]]
 
         # ── Step 5: Build EligibilityAssessment objects ───────────────────────
         assessments = self._build_assessments(
-            opportunities, rule_results_by_opp, scored, ranked, alignment_scores
+            opportunities, rule_results_by_opp, scored, ranked, alignment_scores, alignment_rationales
         )
 
         new_state = state.model_copy(deep=True)
@@ -200,10 +200,14 @@ class RankingStrategistAgent:
 
     async def _get_alignment_scores(
         self, profile: Any, opportunities: list[Opportunity], run_id: str
-    ) -> dict[str, float]:
-        """ONE reasoning-tier LLM call to score field alignment for all opps."""
+    ) -> tuple[dict[str, float], dict[str, str]]:
+        """ONE reasoning-tier LLM call to score field alignment for all opps.
+        
+        Returns tuple of (scores_dict, rationales_dict) where rationales_dict maps
+        opportunity_id to the LLM-generated rationale string.
+        """
         if not opportunities:
-            return {}
+            return {}, {}
 
         prefs = profile.preferences
         candidate_fields = ", ".join(prefs.target_fields[:5]) if prefs.target_fields else "general"
@@ -237,18 +241,21 @@ class RankingStrategistAgent:
                     raw = raw[4:]
             data = json.loads(raw)
             scores = {}
+            rationales = {}
             for item in data:
                 opp_id_prefix = item.get("opportunity_id", "")
                 score = float(item.get("field_alignment", 0.5))
+                rationale = item.get("rationale", "")
                 # Match by prefix since we truncated ID to 8 chars in the prompt
                 for opp in opportunities:
                     if opp.id.startswith(opp_id_prefix) or opp.id == opp_id_prefix:
                         scores[opp.id] = max(0.0, min(1.0, score))
+                        rationales[opp.id] = rationale
                         break
-            return scores
+            return scores, rationales
         except Exception as exc:
             logger.warning("Alignment scoring failed: %s — using neutral 0.5 for all", exc)
-            return {opp.id: 0.5 for opp in opportunities}
+            return {opp.id: 0.5 for opp in opportunities}, {opp.id: "Alignment scoring failed" for opp in opportunities}
 
     def _compute_gpa_margin(self, profile: Any, opp: Opportunity) -> float | None:
         """Compute how much the candidate's GPA exceeds any stated minimum."""
@@ -286,6 +293,7 @@ class RankingStrategistAgent:
         scored: list[tuple[str, CompositeScore]],
         ranked: list[tuple],
         alignment_scores: dict[str, float],
+        alignment_rationales: dict[str, str],
     ) -> list[EligibilityAssessment]:
         """Build EligibilityAssessment objects for all opportunities."""
         score_map = {opp_id: score for opp_id, score in scored}
@@ -297,6 +305,7 @@ class RankingStrategistAgent:
             score = score_map.get(opp.id)
             rank = rank_map.get(opp.id)
             gaps = derive_gaps(rule_results)
+            rationale = alignment_rationales.get(opp.id, "")
 
             eligibility_rules = [
                 EligibilityRule(
@@ -338,7 +347,7 @@ class RankingStrategistAgent:
                 composite_score=score.total if score else 0.0,
                 rank=rank,
                 confidence=opp.verification.completeness_score if opp.verification else 0.5,
-                rationale=f"Score: {score.total:.1f}/100, Rank: {rank}" if score and rank else "",
+                rationale=rationale or f"Score: {score.total:.1f}/100, Rank: {rank}" if score and rank else "",
             ))
 
         return assessments

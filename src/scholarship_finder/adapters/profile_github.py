@@ -19,9 +19,8 @@ from scholarship_finder.errors import (
     RateLimitScope,
     TimeoutError as SFTimeoutError,
     TransientError,
-    UnknownAdapterError,
 )
-from scholarship_finder.ports.profile_source import ProfileSourcePort, ProfileSourceQuery
+from scholarship_finder.ports.profile_source import ProfileSourceQuery
 
 PROVIDER = "github"
 _API_BASE = "https://api.github.com"
@@ -34,9 +33,10 @@ class GitHubAdapter:
     Args:
         token: GitHub personal access token (public-read scope).
                Empty string → unauthenticated (60 req/hr shared IP cap).
+        cache: Optional TTLCache for caching GitHub profiles (Phase 1 optimization).
     """
 
-    def __init__(self, token: str = "") -> None:
+    def __init__(self, token: str = "", cache=None) -> None:
         headers = {
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
@@ -44,14 +44,24 @@ class GitHubAdapter:
         if token:
             headers["Authorization"] = f"Bearer {token}"
         self._headers = headers
+        self._cache = cache
 
     async def fetch_signals(self, query: ProfileSourceQuery) -> ProfileSignals:
         handle = query.handle.strip().lstrip("@")
+
+        # Check cache first (Phase 1 optimization)
+        cache_key = f"github:{handle}"
+        if self._cache is not None:
+            cached = self._cache.get(cache_key)
+            if cached is not None:
+                return cached
+
         async with httpx.AsyncClient(
             base_url=_API_BASE,
             headers=self._headers,
             timeout=_TIMEOUT,
             follow_redirects=True,
+            limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),  # Connection pooling
         ) as client:
             repos, languages, topics = await asyncio.gather(
                 self._fetch_repos(client, handle, query.max_repos),
@@ -93,12 +103,18 @@ class GitHubAdapter:
             f"top topics: {', '.join(sorted_topics[:5]) or 'none'}"
         )
 
-        return ProfileSignals(
+        signals = ProfileSignals(
             projects=project_summaries,
             languages=sorted_langs,
             topics=sorted_topics,
             activity_summary=activity,
         )
+
+        # Cache the result (Phase 1 optimization)
+        if self._cache is not None:
+            self._cache.set(cache_key, signals)
+
+        return signals
 
     def capabilities(self) -> dict[str, Any]:
         return {

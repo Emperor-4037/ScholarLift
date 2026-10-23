@@ -120,14 +120,19 @@ def compute_composite_score(
 
 def rank_opportunities(
     scores: list[tuple[str, CompositeScore]],
+    opp_urls: dict[str, str] | None = None,
 ) -> list[tuple[str, CompositeScore, int]]:
     """Sort opportunity scores and return ranked Top-5 tuples.
 
     Sort key: (total desc, evidence_confidence desc, deadline_distance_days asc).
     A None deadline sorts after any numeric deadline (treated as very far away).
 
+    Ensures diversity by URL: if opp_urls is provided, skips opportunities with
+    duplicate URLs to avoid showing the same opportunity multiple times.
+
     Args:
         scores: List of (opportunity_id, CompositeScore) pairs.
+        opp_urls: Optional dict mapping opportunity_id to official_url for deduplication.
 
     Returns:
         List of (opportunity_id, score, rank) — at most 5 entries, 1-indexed.
@@ -138,7 +143,22 @@ def rank_opportunities(
         return (-s.total, -s.evidence_confidence, dd)
 
     sorted_scores = sorted(scores, key=sort_key)
-    return [
-        (opp_id, score, rank + 1)
-        for rank, (opp_id, score) in enumerate(sorted_scores[:5])
-    ]
+
+    # Select top 5 with URL diversity
+    seen_urls = set()
+    ranked = []
+    for opp_id, score in sorted_scores:
+        if len(ranked) >= 5:
+            break
+
+        # Skip if we've already seen this URL
+        if opp_urls:
+            url = opp_urls.get(opp_id)
+            if url and url in seen_urls:
+                continue
+            if url:
+                seen_urls.add(url)
+
+        ranked.append((opp_id, score, len(ranked) + 1))
+
+    return ranked

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from typing import Any, AsyncIterator
 
@@ -25,8 +26,10 @@ from scholarship_finder.errors import (
     TransientError,
     UnknownAdapterError,
 )
-from scholarship_finder.ports.llm import LLMPort, LLMResult, LLMUsage, TaskSpec
+from scholarship_finder.ports.llm import LLMResult, LLMUsage, TaskSpec
 from scholarship_finder.domain.models import LLMTier
+
+logger = logging.getLogger(__name__)
 
 try:
     from google import genai
@@ -85,12 +88,13 @@ class GeminiAdapter:
     One instance per model ID. The LLM router creates and caches these.
     """
 
-    def __init__(self, api_key: str, model_id: str, tier: LLMTier) -> None:
+    def __init__(self, api_key: str, model_id: str, tier: LLMTier, bus=None) -> None:
         if not _GENAI_AVAILABLE:
             raise ImportError("google-genai is not installed. Run: pip install google-genai")
         self._model_id = model_id
         self._tier = tier
         self._client = genai.Client(api_key=api_key)
+        self._bus = bus  # Optional EventBus for error reporting
 
     # ── Port implementation ───────────────────────────────────────────────────
 
@@ -100,14 +104,38 @@ class GeminiAdapter:
         contents = self._build_contents(spec)
         t0 = time.monotonic()
         try:
-            response = await asyncio.to_thread(
-                self._client.models.generate_content,
-                model=self._model_id,
-                contents=contents,
-                config=config,
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._client.models.generate_content,
+                    model=self._model_id,
+                    contents=contents,
+                    config=config,
+                ),
+                timeout=60.0,  # 60 second timeout for LLM calls
             )
         except Exception as exc:
-            raise _map_error(exc, self._model_id) from exc
+            mapped_error = _map_error(exc, self._model_id)
+            # Publish error event if EventBus is available
+            if self._bus:
+                from scholarship_finder.domain.models import Event, EventKind, EventSeverity
+                from datetime import datetime, timezone
+                try:
+                    await self._bus.publish(Event(
+                        run_id=spec.data_blocks[0].get("run_id", "unknown") if spec.data_blocks else "unknown",
+                        seq=0,
+                        timestamp=datetime.now(timezone.utc),
+                        node="llm_gemini",
+                        severity=EventSeverity.ERROR,
+                        kind=EventKind.ERROR,
+                        payload={
+                            "model": self._model_id,
+                            "error_type": type(mapped_error).__name__,
+                            "message": str(mapped_error),
+                        }
+                    ))
+                except Exception:
+                    pass  # Don't let event publishing fail the LLM call
+            raise mapped_error from exc
 
         latency_ms = (time.monotonic() - t0) * 1000
         return self._parse_response(response, spec, latency_ms)
@@ -123,7 +151,10 @@ class GeminiAdapter:
                     contents=contents,
                     config=config,
                 )
-            stream_iter = await asyncio.to_thread(_run)
+            stream_iter = await asyncio.wait_for(
+                asyncio.to_thread(_run),
+                timeout=60.0,  # 60 second timeout for starting stream
+            )
             for chunk in stream_iter:
                 text = getattr(chunk, "text", "") or ""
                 if text:
@@ -170,13 +201,38 @@ class GeminiAdapter:
         return genai_types.GenerateContentConfig(**kwargs)
 
     def _build_contents(self, spec: TaskSpec) -> list[Any]:
-        """Build the contents list from a TaskSpec."""
-        parts: list[str] = [spec.instruction]
+        """Build the contents list from a TaskSpec.
+
+        Supports both text blocks and image parts for OCR/vision tasks.
+        """
+        parts: list[Any] = [spec.instruction]
+
         for block in spec.data_blocks:
-            label = block.get("label", "DATA")
-            content = block.get("content", "")
-            parts.append(f"\n\n--- {label} ---\n{content}\n--- END {label} ---")
-        return ["\n".join(parts)]
+            block_type = block.get("type", "text")
+
+            if block_type == "image":
+                # Add image part for vision/OCR
+                import base64
+                image_data = block.get("data", "")
+                mime_type = block.get("mime_type", "image/png")
+
+                # Decode base64 if needed
+                if isinstance(image_data, str):
+                    image_bytes = base64.b64decode(image_data)
+                else:
+                    image_bytes = image_data
+
+                parts.append(genai_types.Part.from_bytes(
+                    data=image_bytes,
+                    mime_type=mime_type
+                ))
+            else:
+                # Add text block
+                label = block.get("label", "DATA")
+                content = block.get("content", "")
+                parts.append(f"\n\n--- {label} ---\n{content}\n--- END {label} ---")
+
+        return ["\n".join(p) if isinstance(p, str) else p for p in parts]
 
     def _parse_response(
         self, response: Any, spec: TaskSpec, latency_ms: float
@@ -222,9 +278,10 @@ class GeminiLLMAdapter:
     as configured in settings.
     """
 
-    def __init__(self, api_key: str, settings: Any = None) -> None:
+    def __init__(self, api_key: str, settings: Any = None, bus=None) -> None:
         self._api_key = api_key
         self._settings = settings
+        self._bus = bus  # Optional EventBus for error reporting
         self._adapters: dict[str, GeminiAdapter] = {}
 
     def _get_adapter(self, tier: LLMTier, model: str | None = None) -> GeminiAdapter:
@@ -240,18 +297,87 @@ class GeminiLLMAdapter:
         cache_key = f"{model}:{tier.value}"
         if cache_key not in self._adapters:
             self._adapters[cache_key] = GeminiAdapter(
-                api_key=self._api_key, model_id=model, tier=tier
+                api_key=self._api_key, model_id=model, tier=tier, bus=self._bus
             )
         return self._adapters[cache_key]
 
     async def complete(self, spec: TaskSpec) -> LLMResult:
-        adapter = self._get_adapter(spec.tier)
-        return await adapter.complete(spec)
+        """Try models in chain with fallback on quota errors."""
+        if not self._settings:
+            # No settings - use default behavior
+            adapter = self._get_adapter(spec.tier)
+            return await adapter.complete(spec)
+        
+        # Get model chain for this tier
+        if spec.tier == LLMTier.REASONING:
+            models = self._settings.reasoning_models()
+        elif spec.tier == LLMTier.VISION:
+            models = self._settings.vision_models()
+        else:
+            models = self._settings.fast_models()
+        
+        models = models or ["gemini-3.5-flash-lite"]
+        
+        # Try each model in the chain
+        last_error = None
+        for model in models:
+            try:
+                adapter = self._get_adapter(spec.tier, model)
+                return await adapter.complete(spec)
+            except Exception as exc:
+                from scholarship_finder.errors import QuotaExhaustedError, AdapterError
+                last_error = exc
+                if isinstance(exc, (QuotaExhaustedError, AdapterError)):
+                    logger.warning("Model %s failed, trying next in chain: %s", model, exc)
+                    continue
+                # For other errors, don't retry - let them propagate
+                raise
+        
+        # All models failed
+        if last_error:
+            raise last_error
+        raise RuntimeError("No models available in chain")
 
     async def stream(self, spec: TaskSpec) -> AsyncIterator[str]:
-        adapter = self._get_adapter(spec.tier)
-        async for chunk in adapter.stream(spec):
-            yield chunk
+        """Try models in chain with fallback on quota errors."""
+        if not self._settings:
+            # No settings - use default behavior
+            adapter = self._get_adapter(spec.tier)
+            async for chunk in adapter.stream(spec):
+                yield chunk
+            return
+        
+        # Get model chain for this tier
+        if spec.tier == LLMTier.REASONING:
+            models = self._settings.reasoning_models()
+        elif spec.tier == LLMTier.VISION:
+            models = self._settings.vision_models()
+        else:
+            models = self._settings.fast_models()
+        
+        models = models or ["gemini-3.5-flash-lite"]
+        
+        # Try each model in the chain
+        last_error = None
+        for model in models:
+            try:
+                adapter = self._get_adapter(spec.tier, model)
+                async for chunk in adapter.stream(spec):
+                    yield chunk
+                return  # Success - exit iterator
+            except Exception as exc:
+                from scholarship_finder.errors import QuotaExhaustedError, AdapterError
+                last_error = exc
+                if isinstance(exc, (QuotaExhaustedError, AdapterError)):
+                    logger.warning("Model %s failed during stream, trying next in chain: %s", model, exc)
+                    continue
+                # For other errors, don't retry - let them propagate
+                raise
+        
+        # All models failed
+        if last_error:
+            raise last_error
+        raise RuntimeError("No models available in chain")
 
     def capabilities(self) -> dict[str, Any]:
         return {

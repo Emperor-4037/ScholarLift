@@ -6,20 +6,18 @@ Also supports Serper as an alternative via the same adapter interface.
 """
 from __future__ import annotations
 
-import asyncio
 from typing import Any
 
 import httpx
 
 from scholarship_finder.errors import (
     AuthError,
-    QuotaExhaustedError,
     RateLimitedError,
     RateLimitScope,
     TransientError,
     UnknownAdapterError,
 )
-from scholarship_finder.ports.search import SearchPort, SearchQuery, SearchResult, SearchResultItem
+from scholarship_finder.ports.search import SearchQuery, SearchResult, SearchResultItem
 
 PROVIDER_JINA = "jina_search"
 PROVIDER_SERPER = "serper"

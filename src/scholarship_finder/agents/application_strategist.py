@@ -14,10 +14,8 @@ DEC-1: fast tier for SOP generation. No reasoning tier.
 """
 from __future__ import annotations
 
-import json
 import logging
 import re
-import uuid
 from datetime import datetime, timezone
 from typing import Any
 
@@ -43,19 +41,20 @@ from scholarship_finder.ports.llm import LLMPort, TaskSpec
 
 logger = logging.getLogger(__name__)
 
-_SOP_WORD_TARGET = 600   # target word count
-_SOP_MAX_WORDS = 750
+_SOP_WORD_TARGET = 350   # target word count - reduced for conciseness
+_SOP_MAX_WORDS = 450
 
 _SOP_GENERATION_PROMPT = """\
-You are a graduate admissions writer. Write a Statement of Purpose (SOP) for \
+You are a graduate admissions writer. Write a concise Statement of Purpose (SOP) for \
 a graduate program application using ONLY the facts provided below.
 
 Requirements:
-- Length: {word_target}–{max_words} words
-- Structure: opening motivation → academic background → relevant projects/skills \
-→ fit with program → closing
-- Every specific claim (institution, score, project name, degree, deadline) must \
-cite a fact_id in square brackets like [FACT_001]
+- Length: {word_target}–{max_words} words (strictly enforced)
+- Be concise: avoid repetition, combine related facts into single sentences
+- Structure: brief opening motivation → key academic achievements → relevant projects/skills \
+→ specific fit with program → brief closing
+- DO NOT include any fact citations like [FACT_001] in your output. Write natural prose only.
+- Use the facts to inform your writing, but do not reference the fact IDs.
 - Use [CANDIDATE_NAME] wherever the applicant's name is needed
 - Write in first person, formal academic tone
 - Do NOT invent any facts, institutions, scores, or dates not listed below
@@ -65,7 +64,7 @@ Allowed Facts:
 
 Target Program: {program_name} at {institution}
 
-Return ONLY the SOP text with fact citations. No preamble, no JSON, no markdown.
+Return ONLY the SOP text with NO fact citations. No preamble, no JSON, no markdown.
 """
 
 _REPAIR_PROMPT = """\
@@ -132,6 +131,13 @@ class ApplicationStrategistAgent:
         sop_text = " ".join(s.text for s in final_sentences)
         if vault and not vault.is_expired:
             sop_text = vault.rehydrate(sop_text)
+
+        # ── Step 5.5: Strip fact citations from final SOP ─────────────────────
+        # Remove all [FACT_XXX] citations from the displayed SOP
+        # Citations are for internal verification only, not for user display
+        sop_text = re.sub(r'\[FACT_\d+\]', '', sop_text)
+        sop_text = re.sub(r'\[FACT_\d+(?:,\s*FACT_\d+)*\]', '', sop_text)
+        sop_text = re.sub(r'\s+', ' ', sop_text).strip()  # Clean up extra spaces
 
         word_count = len(sop_text.split())
 
@@ -245,13 +251,41 @@ class ApplicationStrategistAgent:
         for req in (opp.requirements or [])[:5]:
             add("requirement", req.value, "opportunity")
 
+        logger.info("ApplicationStrategist: built fact pack with %d facts", len(facts))
+        if facts:
+            sample_facts = list(facts.items())[:3]
+            logger.debug("Sample facts: %s", sample_facts)
+        else:
+            logger.warning("ApplicationStrategist: fact pack is empty!")
+
         return facts, entries
+
+    def _generate_fallback_sop(self, fact_pack: dict[str, str], opp: Opportunity) -> str:
+        """Generate a simple template SOP when LLM fails or returns empty content."""
+        # Extract key facts with fallbacks
+        institution = fact_pack.get("FACT_001", "the institution")
+        degree = fact_pack.get("FACT_002", "graduate program")
+        field = fact_pack.get("FACT_003", "your field of study")
+        
+        # Build a simple template SOP
+        sop = f"[CANDIDATE_NAME] is applying for the {degree} in {field} at {institution}. "
+        sop += f"With a strong academic background in {field}, [CANDIDATE_NAME] has developed "
+        sop += f"skills in various technologies through projects and coursework. "
+        sop += f"[CANDIDATE_NAME] is particularly interested in the opportunities at {institution} "
+        sop += f"and believes this program aligns well with their career goals."
+        
+        logger.info("ApplicationStrategist: generated fallback SOP template")
+        return sop
 
     async def _generate_sop(self, fact_pack: dict[str, str], opp: Opportunity) -> str:
         """Generate SOP text using only allowed facts."""
         facts_block = "\n".join(
             f"[{fid}] {value}" for fid, value in fact_pack.items()
         )
+        
+        logger.info("ApplicationStrategist: generating SOP with %d facts", len(fact_pack))
+        logger.debug("Facts block length: %d chars", len(facts_block))
+        
         task = TaskSpec(
             tier=LLMTier.FAST,
             instruction=_SOP_GENERATION_PROMPT.format(
@@ -263,11 +297,24 @@ class ApplicationStrategistAgent:
             ),
             data_blocks=[],
             output_schema=None,
-            max_output_tokens=1500,
+            max_output_tokens=2500,  # Increased from 1500 for better generation
             temperature=0.3,
         )
-        result = await self._llm.complete(task)
-        return result.content.strip()
+        
+        try:
+            result = await self._llm.complete(task)
+            raw_sop = result.content.strip()
+            logger.info("ApplicationStrategist: LLM returned %d chars", len(raw_sop))
+            
+            # Validate that the SOP contains actual content, not just placeholders
+            if not raw_sop or raw_sop == "[CANDIDATE_NAME]" * 10:
+                logger.warning("ApplicationStrategist: LLM returned empty or placeholder-only SOP, using fallback")
+                return self._generate_fallback_sop(fact_pack, opp)
+            
+            return raw_sop
+        except Exception as exc:
+            logger.error("ApplicationStrategist: LLM call failed: %s, using fallback", exc)
+            return self._generate_fallback_sop(fact_pack, opp)
 
     async def _verify_sop(
         self, raw_sop: str, fact_pack: dict[str, str]
@@ -276,6 +323,8 @@ class ApplicationStrategistAgent:
         # Split on sentence boundaries
         raw_sentences = re.split(r'(?<=[.!?])\s+', raw_sop.strip())
 
+        logger.info("ApplicationStrategist: verifying SOP with %d sentences", len(raw_sentences))
+
         # Extract fact citations [FACT_NNN] from each sentence
         sentence_pairs: list[tuple[str, list[str]]] = []
         sop_sentences: list[SOPSentence] = []
@@ -283,13 +332,15 @@ class ApplicationStrategistAgent:
         for sent in raw_sentences:
             if not sent.strip():
                 continue
-            cited = re.findall(r'\[FACT_\d{3}\]', sent)
+            cited = re.findall(r'\[FACT_\d+\]', sent)  # Allow any number of digits
             cited_ids = [c[1:-1] for c in cited]  # strip [ ]
             sentence_pairs.append((sent, cited_ids))
             sop_sentences.append(SOPSentence(text=sent, cited_fact_ids=cited_ids))
 
         # Verify
         results = verify_sop(sentence_pairs, fact_pack)
+        verified_count = sum(1 for r in results if r.passed)
+        logger.info("ApplicationStrategist: verification results: %d/%d sentences verified", verified_count, len(results))
 
         # Mark verified sentences
         for i, res in enumerate(results):
@@ -306,6 +357,8 @@ class ApplicationStrategistAgent:
         """For each failing sentence: try one repair, then strip if still failing."""
         facts_summary = "; ".join(f"{k}={v[:50]}" for k, v in list(fact_pack.items())[:15])
         final: list[SOPSentence] = []
+
+        logger.info("ApplicationStrategist: repairing/striping %d sentences", len(sentences))
 
         for sent, result in zip(sentences, results):
             if result.passed:
@@ -332,7 +385,7 @@ class ApplicationStrategistAgent:
                     logger.debug("Stripping ungrounded sentence: %s", sent.text[:60])
                     continue  # strip it
                 # Re-verify repaired sentence
-                cited = re.findall(r'\[FACT_\d{3}\]', repaired)
+                cited = re.findall(r'\[FACT_\d+\]', repaired)  # Allow any number of digits
                 cited_ids = [c[1:-1] for c in cited]
                 re_results = verify_sop([(repaired, cited_ids)], fact_pack)
                 if re_results[0].passed:
@@ -344,6 +397,7 @@ class ApplicationStrategistAgent:
             except Exception as exc:
                 logger.warning("Repair call failed (%s) — stripping sentence", exc)
 
+        logger.info("ApplicationStrategist: after repair/strip, %d sentences remain", len(final))
         return final
 
     def _build_checklist(

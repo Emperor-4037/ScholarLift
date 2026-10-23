@@ -15,10 +15,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any
 
-from scholarship_finder.domain.pii import PIIScrubber, PIIVault
-from scholarship_finder.ports.document import DocumentPort, DocumentResult
+from scholarship_finder.domain.pii import PIIScrubber, PIIVault, _GITHUB_URL_RE
+from scholarship_finder.ports.document import DocumentPort
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +46,11 @@ class IntakeResult:
     backend_used: str
     # Warnings (e.g. scanned PDF detected, some pages empty)
     warnings: list[str]
+    # OCR metadata
+    ocr_used: bool = False
+    ocr_backend: str = ""
+    # Extracted GitHub username from resume URLs
+    github_username: str | None = None
 
 
 class IntakeService:
@@ -97,18 +101,31 @@ class IntakeService:
         self._validate(file_bytes, mime_type, filename)
 
         # ── Extraction ────────────────────────────────────────────────────────
+        ocr_used = False
+        ocr_backend = ""
+        
         if mime_type == "application/pdf":
             doc_result = await self._doc_port.extract(file_bytes, max_pages=50)
             raw_text = doc_result.full_text()
             total_pages = doc_result.total_pages
             is_scanned = doc_result.is_scanned
             backend_used = doc_result.backend_used
+            ocr_used = doc_result.ocr_used
+            ocr_backend = doc_result.ocr_backend
 
             if is_scanned:
-                warnings.append(
-                    f"Document appears to be scanned ({total_pages} pages with minimal text). "
-                    "Extraction quality may be reduced. Consider uploading a text-based PDF."
-                )
+                if doc_result.ocr_used:
+                    warnings.append(
+                        f"Document was scanned ({total_pages} pages). "
+                        f"OCR was applied using {doc_result.ocr_backend} to extract text. "
+                        "Quality may vary - please review extracted text."
+                    )
+                else:
+                    warnings.append(
+                        f"Document appears to be scanned ({total_pages} pages with minimal text). "
+                        "OCR is disabled or unavailable. Extraction quality may be reduced. "
+                        "Consider uploading a text-based PDF."
+                    )
         else:
             # Plain text / Markdown
             raw_text = file_bytes.decode("utf-8", errors="replace")
@@ -134,6 +151,9 @@ class IntakeService:
         scrubber = PIIScrubber(display_name=display_name)
         scrubbed_text = scrubber.scrub(raw_text, vault)
 
+        # ── GitHub Username Extraction ───────────────────────────────────────
+        github_username = self._extract_github_username(raw_text)
+
         logger.info(
             "Intake: file=%r pages=%d scanned=%s chars_raw=%d chars_scrubbed=%d vault_id=%s",
             filename,
@@ -151,11 +171,31 @@ class IntakeService:
             total_pages=total_pages,
             is_scanned=is_scanned,
             backend_used=backend_used,
+            ocr_used=ocr_used,
+            ocr_backend=ocr_backend,
             warnings=warnings,
+            github_username=github_username,
         )
         return result, vault
 
     # ── Internal ──────────────────────────────────────────────────────────────
+
+    def _extract_github_username(self, text: str) -> str | None:
+        """Extract GitHub username from URLs in text."""
+        matches = _GITHUB_URL_RE.findall(text)
+        if matches:
+            logger.debug("Intake: found %d GitHub URL(s) in text", len(matches))
+            # Extract username from URL (last segment)
+            for url in matches:
+                parts = url.rstrip('/').split('/')
+                if len(parts) >= 2:
+                    username = parts[-1]
+                    if username and not username in ['github.com', 'www.github.com']:
+                        logger.info("Intake: extracted GitHub username: %s from URL: %s", username, url)
+                        return username
+        else:
+            logger.debug("Intake: no GitHub URLs found in text")
+        return None
 
     def _validate(self, file_bytes: bytes, mime_type: str, filename: str) -> None:
         if not file_bytes:

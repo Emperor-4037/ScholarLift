@@ -11,11 +11,9 @@ Or as a library:
 from __future__ import annotations
 
 import asyncio
-import os
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Any
 
 
 @dataclass
@@ -70,8 +68,10 @@ async def run_preflight(settings=None) -> PreflightReport:
     for result in checks:
         if isinstance(result, Exception):
             report.checks.append(ProviderCheck(name="unknown", ok=False, detail=str(result)))
-        else:
+        elif isinstance(result, ProviderCheck):
             report.checks.append(result)
+        else:
+            logger.warning("Unexpected check result type: %s", type(result))
 
     report.elapsed_s = time.perf_counter() - start
     return report

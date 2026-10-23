@@ -6,6 +6,7 @@ import pytest
 from scholarship_finder.domain.models import (
     CandidateProfile,
     Education,
+    NormalizedGPA,
     Preferences,
     Project,
     RunDeadlines,
@@ -30,6 +31,13 @@ def sample_profile() -> CandidateProfile:
                 institution="IIT Roorkee",
                 cgpa_value=8.2,
                 cgpa_scale=10.0,
+                normalized_gpa=NormalizedGPA(
+                    value=3.8,
+                    target_scale="us_4point",
+                    method="indian_to_us",
+                    confidence=0.9,
+                    note="Converted from 10.0 scale",
+                ),
             )
         ],
         skills=["Python", "Machine Learning", "PyTorch"],

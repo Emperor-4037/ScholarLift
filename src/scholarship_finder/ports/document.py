@@ -23,6 +23,10 @@ class DocumentResult:
     total_pages: int = 0
     is_scanned: bool = False   # True → very little text extracted; vision fallback needed
     backend_used: str = ""     # "pymupdf" | "pypdf"
+    # OCR-related fields
+    ocr_used: bool = False              # Whether OCR was applied
+    ocr_backend: str = ""              # OCR backend used (e.g., "gemini_vision")
+    ocr_confidence: float = 0.0         # OCR confidence score (0-1)
 
     def full_text(self) -> str:
         return "\n\n".join(p.text for p in self.pages)

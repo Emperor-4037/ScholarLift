@@ -26,9 +26,8 @@ from scholarship_finder.errors import (
     NotFoundError,
     TimeoutError as SFTimeoutError,
     TransientError,
-    UnknownAdapterError,
 )
-from scholarship_finder.ports.fetch import FetchedDocument, FetchPolicy, FetchPort
+from scholarship_finder.ports.fetch import FetchedDocument, FetchPolicy
 from scholarship_finder.resilience.cache import get_fetch_cache, make_fetch_key
 
 try:
@@ -76,13 +75,30 @@ class JinaReaderFetcher:
         }
         if not api_key:
             self._headers.pop("Authorization")
+        # Reuse HTTP client for connection pooling (Phase 1 optimization)
+        self._client: httpx.AsyncClient | None = None
 
-    async def fetch(self, url: str, timeout_s: float = 12.0) -> str:
+    async def _get_client(self, timeout_s: float = 6.0) -> httpx.AsyncClient:
+        """Get or create HTTP client with connection pooling."""
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(
+                timeout=timeout_s,
+                follow_redirects=True,
+                limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),  # Connection pooling
+            )
+        return self._client
+
+    async def close(self):
+        """Close the HTTP client (cleanup)."""
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()
+
+    async def fetch(self, url: str, timeout_s: float = 6.0) -> str:
         """Return normalized markdown text or raise a classified error."""
         jina_url = self.BASE + url
         try:
-            async with httpx.AsyncClient(timeout=timeout_s, follow_redirects=True) as client:
-                resp = await client.get(jina_url, headers=self._headers)
+            client = await self._get_client(timeout_s)
+            resp = await client.get(jina_url, headers=self._headers)
         except httpx.TimeoutException as exc:
             raise SFTimeoutError(PROVIDER, f"Jina Reader timeout for {url}") from exc
         except Exception as exc:
@@ -132,16 +148,34 @@ async def _check_robots(domain: str, client: httpx.AsyncClient) -> bool:
 class DirectHttpFetcher:
     """Direct HTTP fetch with trafilatura main-content extraction."""
 
-    async def fetch(self, url: str, timeout_s: float = 10.0) -> str:
+    def __init__(self):
+        # Reuse HTTP client for connection pooling (Phase 1 optimization)
+        self._client: httpx.AsyncClient | None = None
+
+    async def _get_client(self) -> httpx.AsyncClient:
+        """Get or create HTTP client with connection pooling."""
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(
+                timeout=8.0,
+                follow_redirects=True,
+                max_redirects=5,
+                headers=_DIRECT_HEADERS,
+                limits=httpx.Limits(max_connections=15, max_keepalive_connections=5),  # Connection pooling
+            )
+        return self._client
+
+    async def close(self):
+        """Close the HTTP client (cleanup)."""
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()
+
+    async def fetch(self, url: str, timeout_s: float = 8.0) -> str:
         domain = extract_domain(url)
         try:
-            async with httpx.AsyncClient(
-                timeout=timeout_s, follow_redirects=True, max_redirects=5,
-                headers=_DIRECT_HEADERS,
-            ) as client:
-                if not await _check_robots(domain, client):
-                    raise BlockedError(PROVIDER, f"robots.txt disallows crawling {domain}")
-                resp = await client.get(url)
+            client = await self._get_client()
+            if not await _check_robots(domain, client):
+                raise BlockedError(PROVIDER, f"robots.txt disallows crawling {domain}")
+            resp = await client.get(url)
         except BlockedError:
             raise
         except httpx.TimeoutException as exc:
@@ -223,8 +257,8 @@ class FetchChain:
         # Tier 1: Jina Reader
         try:
             text = await asyncio.wait_for(
-                self._jina.fetch(url, timeout_s=min(12.0, policy.timeout_s)),
-                timeout=min(13.0, policy.timeout_s),
+                self._jina.fetch(url, timeout_s=min(8.0, policy.timeout_s)),
+                timeout=min(9.0, policy.timeout_s),
             )
             tier_used = 1
         except (SFTimeoutError, TransientError, NotFoundError):
@@ -240,8 +274,8 @@ class FetchChain:
                 try:
                     remaining = deadline - time.monotonic()
                     text = await asyncio.wait_for(
-                        self._direct.fetch(url, timeout_s=min(10.0, remaining)),
-                        timeout=min(11.0, remaining),
+                        self._direct.fetch(url, timeout_s=min(8.0, remaining)),
+                        timeout=min(9.0, remaining),
                     )
                     tier_used = 2
                 except (SFTimeoutError, NotFoundError, BlockedError):
@@ -301,3 +335,8 @@ class FetchChain:
             "handles_pdf": True,
             "handles_js": self._enable_browser,
         }
+
+    async def close(self):
+        """Close HTTP clients (cleanup for connection pooling)."""
+        await self._jina.close()
+        await self._direct.close()

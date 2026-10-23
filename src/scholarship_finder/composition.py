@@ -3,20 +3,18 @@
 This is the ONLY place where concrete adapter classes are instantiated.
 All other modules depend on port interfaces only.
 
-Usage (LITE profile):
+Usage:
     from scholarship_finder.composition import build_gateway
     gateway = build_gateway()
     run_id = await gateway.start_run(initial_state)
 
-The returned RunGateway is safe to store as a module-level singleton in the
-Streamlit app (it is async-safe and stateless between runs).
+The returned RunGateway is safe to store as a module-level singleton
+(it is async-safe and stateless between runs).
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-from functools import lru_cache
-from typing import Any
 
 from scholarship_finder.config import get_settings
 from scholarship_finder.engine.gateway import RunGateway
@@ -49,7 +47,8 @@ def build_gateway(settings=None) -> RunGateway:
 
     # ── Resilience stack ──────────────────────────────────────────────────────
     from scholarship_finder.resilience.breaker import BreakerRegistry
-    from scholarship_finder.resilience.quota import QuotaGovernor, QuotaProfile
+    from scholarship_finder.resilience.quota import QuotaGovernor
+    from scholarship_finder.resilience.cache import get_github_cache
 
     breaker_registry = BreakerRegistry()
     quota_governor = QuotaGovernor(
@@ -58,6 +57,9 @@ def build_gateway(settings=None) -> RunGateway:
         max_reasoning_per_run=getattr(cfg, "max_reasoning_calls_per_run", 4),
         is_judge=False,
     )
+
+    # Cross-run caches
+    github_cache = get_github_cache()
 
     # ── Agents ────────────────────────────────────────────────────────────────
     from scholarship_finder.agents.profile_enricher import ProfileEnricherAgent
@@ -88,6 +90,11 @@ def build_gateway(settings=None) -> RunGateway:
         is_replay: bool = False,
     ):
         from scholarship_finder.engine.graph import make_graph
+        
+        # Inject EventBus into LLM adapter for error reporting
+        if hasattr(llm_port, '_bus'):
+            llm_port._bus = bus
+        
         return make_graph(
             profile_enricher_agent=profile_enricher,
             opportunity_scout_agent=opportunity_scout,
@@ -108,8 +115,8 @@ def build_gateway(settings=None) -> RunGateway:
     )
 
     # Attach helpers as convenience attributes
-    gateway.intake_service = intake_service  # type: ignore[attr-defined]
-    gateway.make_graph_runner = make_graph_runner  # type: ignore[attr-defined]
+    gateway.intake_service = intake_service
+    gateway.make_graph_runner = make_graph_runner
 
     logger.info(
         "Composition: gateway built (profile=%s, llm=%s, search=%s)",
@@ -120,7 +127,7 @@ def build_gateway(settings=None) -> RunGateway:
     return gateway
 
 
-def start_run_with_intake(
+async def start_run_with_intake_async(
     gateway: RunGateway,
     file_bytes: bytes,
     filename: str,
@@ -129,37 +136,37 @@ def start_run_with_intake(
     github_username: str | None = None,
     is_replay: bool = False,
 ) -> str:
-    """Run intake synchronously then launch the graph in a background thread.
+    """Run intake asynchronously then launch the graph in a background thread.
 
-    **Fully synchronous** — safe to call directly from the Streamlit script
-    thread without ``asyncio.run`` or ``nest_asyncio``.
+    **Async version** — safe to call from FastAPI async route handlers.
+    Use this when you're already in an async context (e.g., FastAPI routes).
 
     Intake (PDF extraction + PII scrubbing) is I/O-light and fast enough to
-    run synchronously in a tiny temporary event loop.  The heavy work
-    (search, fetch, LLM calls) runs in the background thread started by
-    ``RunGateway.start_run()``.
+    run synchronously. The heavy work (search, fetch, LLM calls) runs in the
+    background thread started by ``RunGateway.start_run()``.
     """
     from scholarship_finder.engine.gateway import make_initial_state
     from scholarship_finder.engine.event_bus import EventBus
 
-    # ── Intake: run async coroutine synchronously in a temp loop ──────────────
-    # This is safe because the Streamlit script thread does NOT have a running
-    # event loop — asyncio.run() creates a fresh one, runs to completion, and
-    # tears it down before returning.
-    async def _intake():
-        return await gateway.intake_service.process(
-            file_bytes, filename, mime_type, display_name=display_name
-        )
+    # ── Intake: run async coroutine directly (we're already in an event loop) ─
+    intake_result, vault = await gateway.intake_service.process(
+        file_bytes, filename, mime_type, display_name=display_name
+    )
 
-    intake_result, vault = asyncio.run(_intake())
+    # Register vault in gateway's registry for later rehydration
+    gateway.vault_registry.register(vault)
 
     initial_state = make_initial_state()
+    # Store vault reference in state for rehydration
+    initial_state.vault_reference = vault.vault_id
 
     # ── Build shared EventBus and per-run graph runner ─────────────────────────
     bus = EventBus()
+    # Use extracted GitHub username from intake, fallback to manual input
+    effective_github_username = intake_result.github_username or github_username
     graph_runner = gateway.make_graph_runner(
         scrubbed_text=intake_result.scrubbed_text,
-        github_username=github_username,
+        github_username=effective_github_username,
         vault=vault,
         bus=bus,
         is_replay=is_replay,
@@ -174,27 +181,84 @@ def start_run_with_intake(
     )
 
 
+def start_run_with_intake(
+    gateway: RunGateway,
+    file_bytes: bytes,
+    filename: str,
+    mime_type: str,
+    display_name: str | None = None,
+    github_username: str | None = None,
+    is_replay: bool = False,
+) -> str:
+    """Run intake synchronously then launch the graph in a background thread.
+
+    **Fully synchronous** — safe to call from non-async contexts.
+
+    Intake (PDF extraction + PII scrubbing) is I/O-light and fast enough to
+    run synchronously in a tiny temporary event loop.  The heavy work
+    (search, fetch, LLM calls) runs in the background thread started by
+    ``RunGateway.start_run()``.
+    """
+    import asyncio
+    
+    # Run the async version
+    return asyncio.run(start_run_with_intake_async(
+        gateway=gateway,
+        file_bytes=file_bytes,
+        filename=filename,
+        mime_type=mime_type,
+        display_name=display_name,
+        github_username=github_username,
+        is_replay=is_replay,
+    ))
+
+
 # ── Internal adapter builders ─────────────────────────────────────────────────
 
 def _build_llm_port(cfg):
-    """Try Gemini first, fall back to Groq/OpenAI-compatible, then stub."""
+    """Try Gemini first, fall back to Groq/OpenAI-compatible, then stub.
+
+    If both Gemini and Groq keys are available, creates a composite adapter
+    that tries Gemini first and falls back to Groq on transient errors.
+    """
     gemini_key = getattr(cfg, "gemini_api_key", None)
+    failover_key = getattr(cfg, "groq_api_key", None) or getattr(cfg, "openai_api_key", None)
+
+    gemini_adapter = None
+    failover_adapter = None
+
+    # Build Gemini adapter
     if gemini_key:
         try:
             from scholarship_finder.adapters.llm_gemini import GeminiLLMAdapter
-            logger.info("LLM: using Gemini adapter")
-            return GeminiLLMAdapter(api_key=gemini_key, settings=cfg)
+            # We'll pass bus later in make_graph_runner
+            gemini_adapter = GeminiLLMAdapter(api_key=gemini_key, settings=cfg, bus=None)
+            logger.info("LLM: Gemini adapter available")
         except Exception as exc:
             logger.warning("Gemini adapter failed to init: %s", exc)
 
-    failover_key = getattr(cfg, "groq_api_key", None) or getattr(cfg, "openai_api_key", None)
+    # Build failover adapter
     if failover_key:
         try:
             from scholarship_finder.adapters.llm_openai import OpenAILLMAdapter
-            logger.info("LLM: using Groq/OpenAI-compatible adapter")
-            return OpenAILLMAdapter(api_key=failover_key, settings=cfg)
+            failover_adapter = OpenAILLMAdapter(api_key=failover_key, settings=cfg, bus=None)
+            logger.info("LLM: Groq/OpenAI failover adapter available")
         except Exception as exc:
             logger.warning("Failover adapter (Groq/OpenAI) failed to init: %s", exc)
+
+    # If both available, create composite with runtime failover
+    if gemini_adapter and failover_adapter:
+        logger.info("LLM: using composite adapter (Gemini primary, Groq failover)")
+        return _CompositeLLMPort(primary=gemini_adapter, failover=failover_adapter)
+
+    # Otherwise use whichever is available
+    if gemini_adapter:
+        logger.info("LLM: using Gemini adapter only")
+        return gemini_adapter
+
+    if failover_adapter:
+        logger.info("LLM: using Groq/OpenAI adapter only")
+        return failover_adapter
 
     logger.warning("LLM: no API keys configured — using stub (REPLAY/test only)")
     return _StubLLMPort()
@@ -231,9 +295,15 @@ def _build_search_ports(cfg):
         except Exception as exc:
             logger.warning("Jina adapter failed: %s", exc)
 
+    # If primary is not configured, use secondary as primary
     if primary is None:
-        logger.warning("Search: no primary search configured — using stub")
-        primary = _StubSearchPort()
+        if secondary is not None:
+            logger.info("Search: no primary configured, using secondary as primary")
+            primary = secondary
+            secondary = None
+        else:
+            logger.warning("Search: no primary or secondary search configured — using stub")
+            primary = _StubSearchPort()
 
     return primary, secondary
 
@@ -249,9 +319,37 @@ def _build_fetch_port(cfg):
 
 
 def _build_document_port(cfg):
+    """Build PDF adapter with optional OCR support."""
+    ocr_adapter = None
+    enable_ocr = getattr(cfg, "enable_ocr", True)
+    ocr_threshold = getattr(cfg, "ocr_threshold_chars", 50)
+    ocr_max_pages = getattr(cfg, "ocr_max_pages", 20)
+
+    if enable_ocr:
+        # Build OCR adapter if vision models are available
+        vision_models = cfg.vision_models()
+        if vision_models:
+            try:
+                from scholarship_finder.adapters.vision_ocr import VisionOCRAdapter
+                # Get the LLM port for OCR (reuse existing or build new)
+                llm_port = _build_llm_port(cfg)
+                ocr_adapter = VisionOCRAdapter(
+                    llm_port=llm_port,
+                    vision_model=vision_models[0],
+                    max_pages=ocr_max_pages,
+                )
+                logger.info("OCR: Vision OCR adapter enabled (model=%s, max_pages=%d)", vision_models[0], ocr_max_pages)
+            except Exception as exc:
+                logger.warning("OCR adapter init failed: %s — OCR disabled", exc)
+        else:
+            logger.warning("OCR enabled but no vision models configured — OCR disabled")
+
     try:
         from scholarship_finder.adapters.document_pdf import PDFDocumentAdapter
-        return PDFDocumentAdapter()
+        return PDFDocumentAdapter(
+            ocr_adapter=ocr_adapter,
+            ocr_threshold=ocr_threshold,
+        )
     except Exception as exc:
         logger.warning("PDF adapter init failed: %s — using stub", exc)
         return _StubDocumentPort()
@@ -262,8 +360,9 @@ def _build_profile_source(cfg):
     if github_token:
         try:
             from scholarship_finder.adapters.profile_github import GitHubProfileAdapter
-            logger.info("ProfileSource: using GitHub adapter")
-            return GitHubProfileAdapter(token=github_token)
+            from scholarship_finder.resilience.cache import get_github_cache
+            logger.info("ProfileSource: using GitHub adapter with caching")
+            return GitHubProfileAdapter(token=github_token, cache=get_github_cache())
         except Exception as exc:
             logger.warning("GitHub adapter failed: %s", exc)
     return None
@@ -273,12 +372,8 @@ def _default_quota_profiles(cfg) -> list:
     from scholarship_finder.resilience.quota import QuotaProfile
     return [
         QuotaProfile(provider="gemini", model="gemini-3.5-flash-lite", rpm=30, rpd=1500),
-        QuotaProfile(provider="gemini", model="gemini-3.5-flash", rpm=15, rpd=1500),
-        QuotaProfile(provider="gemini", model="gemini-flash-lite-latest", rpm=30, rpd=1500),
-        QuotaProfile(provider="gemini", model="gemini-flash-latest", rpm=15, rpd=1500),
-        QuotaProfile(provider="gemini", model="gemini-2.0-flash-lite", rpm=30, rpd=1500),
-        QuotaProfile(provider="gemini", model="gemini-2.0-flash", rpm=15, rpd=1500),
-        QuotaProfile(provider="gemini", model="gemini-2.5-flash", rpm=10, rpd=500),
+        QuotaProfile(provider="gemini", model="gemini-3.6-flash", rpm=15, rpd=1500),
+        QuotaProfile(provider="gemini", model="gemini-3.8-flash", rpm=10, rpd=500),
         QuotaProfile(provider="groq", model="openai/gpt-oss-20b", rpm=30, rpd=1000),
         QuotaProfile(provider="groq", model="openai/gpt-oss-120b", rpm=30, rpd=1000),
         QuotaProfile(provider="openai_compat", model="openai/gpt-oss-20b", rpm=30, rpd=1000),
@@ -286,6 +381,68 @@ def _default_quota_profiles(cfg) -> list:
         QuotaProfile(provider="openai", model="gpt-4o-mini", rpm=60, rpd=3000),
         QuotaProfile(provider="tavily", model="search", rpm=100, rpd=5000),
     ]
+
+
+# ── Composite adapter with runtime failover ─────────────────────────────────
+
+class _CompositeLLMPort:
+    """Composite LLM port that tries primary first, falls back to secondary on errors.
+
+    Used when both Gemini and Groq/OpenAI keys are configured.
+    Transient errors (503, rate limits) trigger automatic failover.
+    """
+    def __init__(self, primary, failover):
+        self._primary = primary
+        self._failover = failover
+        self._use_failover = False  # Switch state after first failover
+
+    async def complete(self, spec):
+        """Try primary, fall back to secondary on transient errors."""
+        from scholarship_finder.errors import TransientError, ModelUnavailableError
+
+        # Try primary first
+        if not self._use_failover:
+            try:
+                return await self._primary.complete(spec)
+            except (TransientError, ModelUnavailableError) as e:
+                logger.warning("LLM primary failed (%s), switching to failover", type(e).__name__)
+                self._use_failover = True
+            except Exception as e:
+                # Non-transient errors still fail immediately
+                raise
+
+        # Use failover
+        logger.info("LLM: using failover adapter")
+        return await self._failover.complete(spec)
+
+    async def stream(self, spec):
+        """Stream from primary, fall back to secondary on transient errors."""
+        from scholarship_finder.errors import TransientError, ModelUnavailableError
+
+        if not self._use_failover:
+            try:
+                async for chunk in self._primary.stream(spec):
+                    yield chunk
+                return
+            except (TransientError, ModelUnavailableError) as e:
+                logger.warning("LLM primary stream failed (%s), switching to failover", type(e).__name__)
+                self._use_failover = True
+            except Exception as e:
+                raise
+
+        logger.info("LLM: using failover adapter for streaming")
+        async for chunk in self._failover.stream(spec):
+            yield chunk
+
+    def capabilities(self):
+        # Return primary's capabilities
+        return self._primary.capabilities()
+
+    # Optional: Add bus for error reporting (backward compatible)
+    def set_event_bus(self, bus):
+        """Set event bus for error reporting (optional)."""
+        # Store bus reference if needed for future error publishing
+        pass
 
 
 # ── Stub ports (used when no API keys are configured) ─────────────────────────

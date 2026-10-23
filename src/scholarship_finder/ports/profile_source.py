@@ -5,7 +5,7 @@ Extension point for GitLab, Kaggle, personal portfolios, etc.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 from scholarship_finder.domain.models import ProfileSignals
