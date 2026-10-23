@@ -88,13 +88,14 @@ def build_gateway(settings=None) -> RunGateway:
         vault,
         bus,
         is_replay: bool = False,
+        force_refresh: bool = False,
     ):
         from scholarship_finder.engine.graph import make_graph
-        
+
         # Inject EventBus into LLM adapter for error reporting
         if hasattr(llm_port, '_bus'):
             llm_port._bus = bus
-        
+
         return make_graph(
             profile_enricher_agent=profile_enricher,
             opportunity_scout_agent=opportunity_scout,
@@ -106,6 +107,7 @@ def build_gateway(settings=None) -> RunGateway:
             github_username=github_username,
             vault=vault,
             is_replay=is_replay,
+            force_refresh=force_refresh,
         )
 
     # ── RunGateway ────────────────────────────────────────────────────────────
@@ -135,6 +137,7 @@ async def start_run_with_intake_async(
     display_name: str | None = None,
     github_username: str | None = None,
     is_replay: bool = False,
+    force_refresh: bool = False,
 ) -> str:
     """Run intake asynchronously then launch the graph in a background thread.
 
@@ -159,6 +162,8 @@ async def start_run_with_intake_async(
     initial_state = make_initial_state()
     # Store vault reference in state for rehydration
     initial_state.vault_reference = vault.vault_id
+    # Store force_refresh flag in state for cache bypass
+    initial_state.force_refresh = force_refresh
 
     # ── Build shared EventBus and per-run graph runner ─────────────────────────
     bus = EventBus()
@@ -170,6 +175,7 @@ async def start_run_with_intake_async(
         vault=vault,
         bus=bus,
         is_replay=is_replay,
+        force_refresh=force_refresh,
     )
 
     # ── Hand off to RunGateway (synchronous — launches background thread) ──────
@@ -189,6 +195,7 @@ def start_run_with_intake(
     display_name: str | None = None,
     github_username: str | None = None,
     is_replay: bool = False,
+    force_refresh: bool = False,
 ) -> str:
     """Run intake synchronously then launch the graph in a background thread.
 
@@ -200,7 +207,7 @@ def start_run_with_intake(
     ``RunGateway.start_run()``.
     """
     import asyncio
-    
+
     # Run the async version
     return asyncio.run(start_run_with_intake_async(
         gateway=gateway,
@@ -210,54 +217,55 @@ def start_run_with_intake(
         display_name=display_name,
         github_username=github_username,
         is_replay=is_replay,
+        force_refresh=force_refresh,
     ))
 
 
 # ── Internal adapter builders ─────────────────────────────────────────────────
 
 def _build_llm_port(cfg):
-    """Try Gemini first, fall back to Groq/OpenAI-compatible, then stub.
+    """Try Groq first (more stable), fall back to Gemini, then stub.
 
-    If both Gemini and Groq keys are available, creates a composite adapter
-    that tries Gemini first and falls back to Groq on transient errors.
+    If both Groq and Gemini keys are available, creates a composite adapter
+    that tries Groq first and falls back to Gemini on transient errors.
     """
+    groq_key = getattr(cfg, "groq_api_key", None) or getattr(cfg, "openai_api_key", None)
     gemini_key = getattr(cfg, "gemini_api_key", None)
-    failover_key = getattr(cfg, "groq_api_key", None) or getattr(cfg, "openai_api_key", None)
 
-    gemini_adapter = None
+    primary_adapter = None
     failover_adapter = None
 
-    # Build Gemini adapter
-    if gemini_key:
-        try:
-            from scholarship_finder.adapters.llm_gemini import GeminiLLMAdapter
-            # We'll pass bus later in make_graph_runner
-            gemini_adapter = GeminiLLMAdapter(api_key=gemini_key, settings=cfg, bus=None)
-            logger.info("LLM: Gemini adapter available")
-        except Exception as exc:
-            logger.warning("Gemini adapter failed to init: %s", exc)
-
-    # Build failover adapter
-    if failover_key:
+    # Build Groq/OpenAI adapter (primary - more stable)
+    if groq_key:
         try:
             from scholarship_finder.adapters.llm_openai import OpenAILLMAdapter
-            failover_adapter = OpenAILLMAdapter(api_key=failover_key, settings=cfg, bus=None)
-            logger.info("LLM: Groq/OpenAI failover adapter available")
+            primary_adapter = OpenAILLMAdapter(api_key=groq_key, settings=cfg, bus=None)
+            logger.info("LLM: Groq/OpenAI adapter available (primary)")
         except Exception as exc:
-            logger.warning("Failover adapter (Groq/OpenAI) failed to init: %s", exc)
+            logger.warning("Groq/OpenAI adapter failed to init: %s", exc)
+
+    # Build Gemini adapter (failover) - only if quota not exhausted
+    # Commented out temporarily due to quota exhaustion
+    # if gemini_key:
+    #     try:
+    #         from scholarship_finder.adapters.llm_gemini import GeminiLLMAdapter
+    #         failover_adapter = GeminiLLMAdapter(api_key=gemini_key, settings=cfg, bus=None)
+    #         logger.info("LLM: Gemini adapter available (failover)")
+    #     except Exception as exc:
+    #         logger.warning("Gemini adapter failed to init: %s", exc)
 
     # If both available, create composite with runtime failover
-    if gemini_adapter and failover_adapter:
-        logger.info("LLM: using composite adapter (Gemini primary, Groq failover)")
-        return _CompositeLLMPort(primary=gemini_adapter, failover=failover_adapter)
+    if primary_adapter and failover_adapter:
+        logger.info("LLM: using composite adapter (Groq primary, Gemini failover)")
+        return _CompositeLLMPort(primary=primary_adapter, failover=failover_adapter)
 
     # Otherwise use whichever is available
-    if gemini_adapter:
-        logger.info("LLM: using Gemini adapter only")
-        return gemini_adapter
+    if primary_adapter:
+        logger.info("LLM: using Groq/OpenAI adapter only")
+        return primary_adapter
 
     if failover_adapter:
-        logger.info("LLM: using Groq/OpenAI adapter only")
+        logger.info("LLM: using Gemini adapter only")
         return failover_adapter
 
     logger.warning("LLM: no API keys configured — using stub (REPLAY/test only)")
@@ -398,13 +406,17 @@ class _CompositeLLMPort:
 
     async def complete(self, spec):
         """Try primary, fall back to secondary on transient errors."""
-        from scholarship_finder.errors import TransientError, ModelUnavailableError
+        from scholarship_finder.errors import (
+            TransientError, ModelUnavailableError, AdapterError,
+            UnknownAdapterError, QuotaExhaustedError, RateLimitedError,
+        )
 
         # Try primary first
         if not self._use_failover:
             try:
                 return await self._primary.complete(spec)
-            except (TransientError, ModelUnavailableError) as e:
+            except (TransientError, ModelUnavailableError, UnknownAdapterError,
+                    QuotaExhaustedError, RateLimitedError, AdapterError) as e:
                 logger.warning("LLM primary failed (%s), switching to failover", type(e).__name__)
                 self._use_failover = True
             except Exception as e:
@@ -417,14 +429,18 @@ class _CompositeLLMPort:
 
     async def stream(self, spec):
         """Stream from primary, fall back to secondary on transient errors."""
-        from scholarship_finder.errors import TransientError, ModelUnavailableError
+        from scholarship_finder.errors import (
+            TransientError, ModelUnavailableError, AdapterError,
+            UnknownAdapterError, QuotaExhaustedError, RateLimitedError,
+        )
 
         if not self._use_failover:
             try:
                 async for chunk in self._primary.stream(spec):
                     yield chunk
                 return
-            except (TransientError, ModelUnavailableError) as e:
+            except (TransientError, ModelUnavailableError, UnknownAdapterError,
+                    QuotaExhaustedError, RateLimitedError, AdapterError) as e:
                 logger.warning("LLM primary stream failed (%s), switching to failover", type(e).__name__)
                 self._use_failover = True
             except Exception as e:

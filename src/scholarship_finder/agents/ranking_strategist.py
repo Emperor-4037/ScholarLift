@@ -278,7 +278,23 @@ class RankingStrategistAgent:
             if dl.date:
                 try:
                     from dateutil.parser import parse as parse_date
-                    deadline_date = parse_date(dl.date).date()
+                    from dateutil.tz import gettz
+                    # Common timezone abbreviations mapping
+                    tzinfos = {
+                        'ET': gettz('America/New_York'),
+                        'EST': gettz('America/New_York'),
+                        'EDT': gettz('America/New_York'),
+                        'CT': gettz('America/Chicago'),
+                        'CST': gettz('America/Chicago'),
+                        'CDT': gettz('America/Chicago'),
+                        'PT': gettz('America/Los_Angeles'),
+                        'PST': gettz('America/Los_Angeles'),
+                        'PDT': gettz('America/Los_Angeles'),
+                        'MT': gettz('America/Denver'),
+                        'MST': gettz('America/Denver'),
+                        'MDT': gettz('America/Denver'),
+                    }
+                    deadline_date = parse_date(dl.date, tzinfos=tzinfos).date()
                     days = (deadline_date - today).days
                     if days >= 0:
                         return days

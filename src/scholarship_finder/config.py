@@ -53,9 +53,10 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
 
     # Ordered comma-separated model IDs; first = highest preference
-    tier_fast_chain: str = "gemini-3.5-flash-lite,gemini-3.6-flash"
-    tier_reasoning_chain: str = "gemini-3.6-flash"
-    tier_vision_chain: str = "gemini-3.5-flash"
+    # Using only Groq GPT-OSS (Gemini quota exhausted until ~15h from now)
+    tier_fast_chain: str = "openai/gpt-oss-20b,openai/gpt-oss-120b"
+    tier_reasoning_chain: str = "openai/gpt-oss-120b,openai/gpt-oss-20b"
+    tier_vision_chain: str = "openai/gpt-oss-120b"
 
     # Hard cap from DEC-1: ≤4 reasoning calls per run
     max_reasoning_calls_per_run: int = 4

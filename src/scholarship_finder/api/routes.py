@@ -63,8 +63,9 @@ async def upload_resume(
             display_name=display_name,
             github_username=github_username,
             is_replay=False,
+            force_refresh=force_refresh,
         )
-        logger.info(f"Upload successful: run_id={run_id}")
+        logger.info(f"Upload successful: run_id={run_id}, force_refresh={force_refresh}")
         return {"run_id": run_id, "status": "started"}
     except Exception as e:
         logger.error(f"Upload failed: {e}", exc_info=True)
@@ -194,7 +195,7 @@ async def get_rehydrated_sop(run_id: str):
         raise HTTPException(status_code=404, detail="Run not found")
 
     if not snapshot.application_package:
-        raise HTTPException(status_code=404, detail="SOP not generated")
+        return {"sop_text": "", "status": "not_generated"}
 
     sop_text = snapshot.application_package.sop_text
     vault_id = snapshot.vault_reference

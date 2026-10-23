@@ -12,6 +12,7 @@ from typing import Any, AsyncIterator
 
 from scholarship_finder.domain.models import LLMTier
 from scholarship_finder.errors import (
+    AdapterError,
     AuthError,
     ContentBlockedError,
     ContextTooLongError,
@@ -262,6 +263,7 @@ class OpenAILLMAdapter:
 
         if not model:
             if "groq.com" in self._base_url:
+                # Use Groq GPT-OSS models
                 model = "openai/gpt-oss-120b" if tier == LLMTier.REASONING else "openai/gpt-oss-20b"
             else:
                 model = "gpt-4o" if tier == LLMTier.REASONING else "gpt-4o-mini"
@@ -278,13 +280,80 @@ class OpenAILLMAdapter:
         return self._adapters[cache_key]
 
     async def complete(self, spec: TaskSpec) -> LLMResult:
-        adapter = self._get_adapter(spec.tier)
-        return await adapter.complete(spec)
+        """Try models in chain with fallback on transient/quota errors."""
+        import asyncio
+        import logging
+        from scholarship_finder.errors import (
+            QuotaExhaustedError, AdapterError, TransientError as SFTransientError,
+            ModelUnavailableError, RateLimitedError,
+        )
+
+        logger = logging.getLogger(__name__)
+
+        # Get model chain for this tier - filter to only non-Gemini models
+        if self._settings:
+            if spec.tier == LLMTier.REASONING:
+                models = [m for m in self._settings.reasoning_models() if not m.startswith("gemini")]
+            elif spec.tier == LLMTier.VISION:
+                models = [m for m in self._settings.vision_models() if not m.startswith("gemini")]
+            else:
+                models = [m for m in self._settings.fast_models() if not m.startswith("gemini")]
+        else:
+            models = []
+
+        if not models:
+            # No models configured, use default
+            adapter = self._get_adapter(spec.tier)
+            return await adapter.complete(spec)
+
+        # Try each model in the chain
+        last_error = None
+        for model in models:
+            try:
+                adapter = self._get_adapter_for_model(spec.tier, model)
+                return await adapter.complete(spec)
+            except Exception as exc:
+                last_error = exc
+                if isinstance(exc, (QuotaExhaustedError, ModelUnavailableError)):
+                    logger.warning("Model %s unavailable/exhausted, trying next in chain: %s", model, exc)
+                    continue
+                elif isinstance(exc, (SFTransientError, RateLimitedError)):
+                    logger.warning("Model %s transient error, retrying once: %s", model, exc)
+                    try:
+                        await asyncio.sleep(2.0)
+                        adapter2 = self._get_adapter_for_model(spec.tier, model)
+                        return await adapter2.complete(spec)
+                    except Exception as exc2:
+                        logger.warning("Model %s retry also failed, trying next in chain: %s", model, exc2)
+                        last_error = exc2
+                        continue
+                elif isinstance(exc, AdapterError):
+                    logger.warning("Model %s failed, trying next in chain: %s", model, exc)
+                    continue
+                raise
+
+        if last_error:
+            raise last_error
+        raise RuntimeError("No models available in chain")
 
     async def stream(self, spec: TaskSpec) -> AsyncIterator[str]:
+        """Stream from the first available model."""
         adapter = self._get_adapter(spec.tier)
         async for chunk in adapter.stream(spec):
             yield chunk
+
+    def _get_adapter_for_model(self, tier: LLMTier, model: str) -> OpenAICompatAdapter:
+        """Get adapter for a specific model name."""
+        cache_key = f"{model}:{tier.value}"
+        if cache_key not in self._adapters:
+            self._adapters[cache_key] = OpenAICompatAdapter(
+                api_key=self._api_key,
+                base_url=self._base_url,
+                model_id=model,
+                tier=tier,
+                bus=self._bus,
+            )
+        return self._adapters[cache_key]
 
     def capabilities(self) -> dict[str, Any]:
         return {

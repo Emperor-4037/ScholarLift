@@ -51,6 +51,8 @@ class IntakeResult:
     ocr_backend: str = ""
     # Extracted GitHub username from resume URLs
     github_username: str | None = None
+    # Extracted candidate name from resume (if not provided)
+    extracted_name: str | None = None
 
 
 class IntakeService:
@@ -146,6 +148,14 @@ class IntakeService:
                 "Results may be limited."
             )
 
+        # ── Name Extraction (if not provided) ─────────────────────────────────
+        extracted_name = None
+        if not display_name or not display_name.strip():
+            extracted_name = self._extract_name(raw_text)
+            display_name = extracted_name
+            if display_name:
+                logger.info("Intake: extracted name from resume: %s", display_name)
+
         # ── PII Scrubbing ─────────────────────────────────────────────────────
         vault = PIIVault(ttl_seconds=self._vault_ttl)
         scrubber = PIIScrubber(display_name=display_name)
@@ -175,10 +185,57 @@ class IntakeService:
             ocr_backend=ocr_backend,
             warnings=warnings,
             github_username=github_username,
+            extracted_name=extracted_name,
         )
         return result, vault
 
     # ── Internal ──────────────────────────────────────────────────────────────
+
+    def _extract_name(self, text: str) -> str | None:
+        """Extract candidate name from resume text.
+
+        Looks for name patterns at the beginning of the document.
+        Returns None if no clear name is found.
+        """
+        import re
+
+        # Get first few lines (where name typically appears)
+        lines = text.split('\n')[:10]
+        first_text = '\n'.join(lines).strip()
+
+        # Pattern 1: Name at the very beginning (no digits, no URLs, proper case)
+        # Match lines that look like names (2-4 words, capitalized, no special chars)
+        name_pattern = re.compile(
+            r'^([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})$',
+            re.MULTILINE
+        )
+
+        # Try to find a name in the first few lines
+        for line in lines[:5]:
+            line = line.strip()
+            if not line:
+                continue
+
+            # Skip lines with obvious non-name content
+            if any(x in line.lower() for x in ['resume', 'cv', 'curriculum', 'vitae', 'experience', 'education', 'objective', 'summary', 'email', 'phone', 'linkedin', 'github', 'portfolio', 'http', 'www', '.com', '@']):
+                continue
+
+            # Skip lines with digits
+            if re.search(r'\d', line):
+                continue
+
+            # Try to match name pattern
+            match = name_pattern.match(line)
+            if match:
+                candidate_name = match.group(1).strip()
+                # Basic validation: should be 2-4 words, all start with capital
+                words = candidate_name.split()
+                if 2 <= len(words) <= 4 and all(w[0].isupper() for w in words):
+                    logger.info("Intake: extracted name '%s' from line: %s", candidate_name, line)
+                    return candidate_name
+
+        logger.debug("Intake: could not extract name from resume")
+        return None
 
     def _extract_github_username(self, text: str) -> str | None:
         """Extract GitHub username from URLs in text."""

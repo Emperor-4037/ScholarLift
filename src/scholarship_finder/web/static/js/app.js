@@ -1,6 +1,8 @@
 // Application state
 let currentRunId = null;
 let eventSource = null;
+let runCounter = 0;
+let resultsFetchedForRun = null;
 
 // DOM elements
 const uploadForm = document.getElementById('upload-form');
@@ -41,6 +43,8 @@ uploadForm.addEventListener('submit', async (e) => {
         
         if (response.ok) {
             currentRunId = data.run_id;
+            resultsFetchedForRun = null;
+            runCounter++;
             startEventStream(currentRunId);
             showProgress();
         } else {
@@ -73,22 +77,27 @@ function startEventStream(runId) {
 // Event handler
 function handleEvent(event) {
     const timestamp = new Date().toLocaleTimeString();
-    const logEntry = `[${timestamp}] ${event.node || 'system'}: ${event.kind || event.type}\n`;
-    telemetryLog.textContent += logEntry;
+    const logEntry = `[Run #${runCounter}] [${timestamp}] ${event.node || 'system'}: ${event.kind || event.type}<br>`;
+    telemetryLog.innerHTML += logEntry;
     telemetryLog.scrollTop = telemetryLog.scrollHeight;
 
     // Show critical errors prominently
-    if (event.kind === 'ERROR' || event.severity === 'ERROR') {
+    if (event.kind === 'error' || event.severity === 'ERROR') {
         showError(event);
     }
 
     // Update progress based on phase
-    if (event.kind === 'NODE_STARTED') {
+    if (event.kind === 'node_started') {
         updateProgress(event.node);
     }
 
-    // Show results when phase A is ready
-    if (event.kind === 'PHASE_A_READY') {
+    // Show results when phase A is ready (top-5 ranked)
+    if (event.kind === 'phase_a_ready') {
+        showResults();
+    }
+
+    if (event.kind === 'run_degraded') {
+        showError(event);
         showResults();
     }
 
@@ -98,7 +107,7 @@ function handleEvent(event) {
     }
 
     // Handle completion
-    if (event.type === 'complete') {
+    if (event.type === 'complete' || event.kind === 'run_completed') {
         eventSource.close();
         showResults();
     }
@@ -176,14 +185,18 @@ function renderProfile(profileData) {
 }
 
 function showResults() {
+    if (!currentRunId || resultsFetchedForRun === currentRunId) {
+        return;
+    }
+    resultsFetchedForRun = currentRunId;
     progressSection.classList.add('hidden');
     resultsSection.classList.remove('hidden');
 
     // Fetch profile, enriched opportunities, and rehydrated SOP in parallel
     Promise.all([
-        fetch(`/api/profile/${currentRunId}`).then(res => res.json()),
-        fetch(`/api/opportunities/${currentRunId}`).then(res => res.json()),
-        fetch(`/api/sop/${currentRunId}`).then(res => res.json())
+        fetch(`/api/profile/${currentRunId}`).then(res => res.ok ? res.json() : {profile: {}, completeness_flags: {}, enrichment_tips: [], completeness_score: 0}),
+        fetch(`/api/opportunities/${currentRunId}`).then(res => res.ok ? res.json() : {opportunities: []}),
+        fetch(`/api/sop/${currentRunId}`).then(res => res.ok ? res.json() : {sop_text: ''})
     ])
     .then(([profileData, oppData, sopData]) => {
         // Render profile with enrichment tips
@@ -314,6 +327,7 @@ clearDataBtn.addEventListener('click', () => {
             .catch(error => console.error('Failed to cancel:', error));
     }
     currentRunId = null;
+    resultsFetchedForRun = null;
     if (eventSource) {
         eventSource.close();
     }
@@ -324,4 +338,5 @@ clearDataBtn.addEventListener('click', () => {
     profileSummary.textContent = '';
     enrichmentTips.textContent = '';
     uploadForm.reset();
+    // Note: runCounter is NOT reset to maintain numbering across runs
 });

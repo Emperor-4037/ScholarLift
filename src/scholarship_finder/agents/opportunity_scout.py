@@ -42,25 +42,29 @@ logger = logging.getLogger(__name__)
 # Maximum URLs to pass forward
 _MAX_CANDIDATES = 20  # Reduced from 30 for token efficiency
 
-# Trusted domain lists for domain-constrained search
-# Note: Removed aggregators (scholarships.com, fastweb.com, etc.) - only official domains
-_TRUSTED_SCHOLARSHIP_DOMAINS = [
-    ".gov",  # Government agencies
-    ".edu",  # Universities and colleges
-    # Removed: scholarships.com, fastweb.com, bigfuture.collegeboard.org (aggregators)
-]
+# Tavily include_domains requires hostnames, not TLD suffixes like ".edu".
+# Suffix filters return zero hits, which is why scout + auditor produced
+# no verified opportunities. Constrain only funder queries to known bodies.
+_TRUSTED_SCHOLARSHIP_DOMAINS: list[str] = []
 
-_TRUSTED_PROGRAM_DOMAINS = [
-    ".edu",  # Universities and colleges
-]
+_TRUSTED_PROGRAM_DOMAINS: list[str] = []
 
 _TRUSTED_FUNDER_DOMAINS = [
-    ".gov",  # Government agencies
-    ".edu",  # University foundations
-    "foundationcenter.org",
-    "grant.gov",
-    "nsf.gov",
-    "nih.gov",
+    "daad.de",
+    "chevening.org",
+    "fulbright.org",
+    "fulbrightscholars.org",
+    "commonwealthscholarships.ac.uk",
+    "erasmusplus.eu",
+    "eacea.ec.europa.eu",
+    "a-star.edu.sg",
+    "moe.gov.sg",
+    "nserc-crsng.gc.ca",
+    "sshrc-crsh.gc.ca",
+    "humboldt-foundation.de",
+    "studienstiftung.de",
+    "csc.edu.cn",
+    "mastercardfdn.org",
 ]
 
 # Domains to exclude from search results (aggregators and listing sites)
@@ -156,6 +160,7 @@ class OpportunityScoutAgent:
         self._llm = llm_port
         self._search = search_port
         self._secondary = secondary_search
+        self._force_refresh = False
 
     async def run(self, state: SwarmState, bus: EventBus) -> SwarmState:
         """Generate a search plan and scout candidates.
@@ -167,6 +172,11 @@ class OpportunityScoutAgent:
         if profile is None:
             logger.error("OpportunityScout: no profile in state — skipping")
             return state
+
+        # Check if force_refresh is enabled
+        self._force_refresh = state.force_refresh
+        if self._force_refresh:
+            logger.info("OpportunityScout: force_refresh enabled - using advanced search depth for all queries")
 
         await bus.publish(Event(
             run_id=run_id,
@@ -252,7 +262,12 @@ class OpportunityScoutAgent:
         import json
         import uuid
 
-        prefs = profile.preferences
+        prefs = profile.preferences if profile.preferences else type('obj', (object,), {
+            'target_fields': [],
+            'countries': [],
+            'degree_level': 'masters',
+            'funding_required': True
+        })()
         fields_str = ", ".join(prefs.target_fields[:5]) if prefs.target_fields else "any field"
         countries_str = ", ".join(prefs.countries[:5]) if prefs.countries else "any country"
         skills_str = ", ".join(profile.skills[:10]) if profile.skills else "none listed"
@@ -286,8 +301,24 @@ class OpportunityScoutAgent:
         try:
             data = json.loads(raw)
             queries_raw = data.get("queries", [])
-        except Exception:
-            logger.warning("Query plan JSON parse error — using fallback queries")
+        except json.JSONDecodeError as json_err:
+            logger.warning("Query plan JSON parse error: %s — attempting repair", json_err)
+            # Try to repair JSON by extracting just the queries array
+            try:
+                if '[' in raw and ']' in raw:
+                    start = raw.find('[')
+                    end = raw.rfind(']') + 1
+                    raw_array = raw[start:end]
+                    # Try to clean common issues
+                    raw_array = raw_array.replace('\n', ' ').replace('\t', ' ')
+                    queries_raw = json.loads(raw_array)
+                else:
+                    raise ValueError("No JSON array found")
+            except Exception as repair_err:
+                logger.error("JSON repair failed: %s — using fallback queries", repair_err)
+                queries_raw = []
+        except Exception as exc:
+            logger.warning("Query plan parsing error: %s — using fallback queries", exc)
             queries_raw = []
 
         queries: list[SearchQuery] = []
@@ -310,10 +341,15 @@ class OpportunityScoutAgent:
                     i, q.get("intent"), q.get("country"), keyword_count, len(query_text), reasoning[:50]
                 )
                 
-                # Apply domain filtering for some queries (alternate between filtered and unfiltered)
                 intent = str(q.get("intent", "program"))
-                include_domains = _get_trusted_domains(intent) if i % 2 == 0 else []
-                
+                # Only pin funder queries to known official hosts. Program and
+                # scholarship queries stay unfiltered so Tavily can return .edu /
+                # .ac.uk / .gov.sg pages (suffix include_domains is invalid).
+                include_domains = _get_trusted_domains(intent) if intent == "funder" else []
+
+                # Use advanced depth if force_refresh is enabled
+                depth = "advanced" if self._force_refresh else str(q.get("depth", "basic"))
+
                 queries.append(SearchQuery(
                     id=str(uuid.uuid4()),
                     text=query_text,
@@ -321,7 +357,7 @@ class OpportunityScoutAgent:
                     country=q.get("country"),
                     include_domains=include_domains,
                     exclude_domains=_EXCLUDE_DOMAINS,  # Exclude aggregators from all queries
-                    depth=str(q.get("depth", "basic")),
+                    depth=depth,
                     round_number=round_number,
                 ))
             except Exception as exc:
@@ -394,6 +430,12 @@ class OpportunityScoutAgent:
             exclude_domains=query.exclude_domains if query.exclude_domains else [],
         )
         result = await active_port.search(sq)
+        logger.info(
+            "Search %s returned %d hits for %r",
+            result.provider or type(active_port).__name__,
+            len(result.items),
+            query.text[:80],
+        )
         return [
             {
                 "url": item.url,
@@ -450,7 +492,14 @@ def _canonicalize_and_classify(
     candidates = list(seen.values())
     # Sort by trust tier (highest first) and cap
     candidates.sort(key=lambda c: _tier_rank(c.trust_tier), reverse=True)
-    return candidates[:_MAX_CANDIDATES]
+    capped = candidates[:_MAX_CANDIDATES]
+    logger.info(
+        "Scout canonicalized %d unique URLs → %d candidates (cap %d)",
+        len(candidates),
+        len(capped),
+        _MAX_CANDIDATES,
+    )
+    return capped
 
 
 def _infer_kind(intent: str) -> OpportunityKind:
@@ -539,14 +588,20 @@ def _generate_query_variants(base_query: SearchQuery) -> list[SearchQuery]:
 
 def _fallback_queries(profile: Any, round_number: int) -> list[SearchQuery]:
     """Enhanced fallback with query expansion when LLM query planning fails.
-    
+
     Uses multiple funding keyword variants and synonyms to improve recall.
     """
     import uuid
-    prefs = profile.preferences
-    country = prefs.countries[0] if prefs.countries else "international"
-    field = prefs.target_fields[0] if prefs.target_fields else "graduate"
-    level = prefs.degree_level or "masters"
+    # Handle missing preferences gracefully
+    if profile.preferences:
+        prefs = profile.preferences
+        country = prefs.countries[0] if prefs.countries else "international"
+        field = prefs.target_fields[0] if prefs.target_fields else "graduate"
+        level = prefs.degree_level or "masters"
+    else:
+        country = "international"
+        field = "graduate"
+        level = "masters"
 
     # Query expansion: multiple keyword variants for each intent
     return [

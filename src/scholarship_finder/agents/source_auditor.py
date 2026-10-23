@@ -141,14 +141,133 @@ class SourceAuditorAgent:
 
     def _clean_json_string(self, json_str: str) -> str:
         """Clean and repair common JSON issues from LLM output."""
-        # Remove control characters except \n, \r, \t
         import re
+
+        # Remove control characters except \n, \r, \t
         json_str = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', json_str)
-        
+
+        # Fix common issues with unterminated strings by removing trailing characters
+        # after the last complete value in the JSON
+        # Try to find the last complete object/array and truncate after it
+        lines = json_str.split('\n')
+        cleaned_lines = []
+        for line in lines:
+            # Remove trailing commas that would break JSON (at end of objects/arrays)
+            line = re.sub(r',\s*([}\]])', r'\1', line)
+            cleaned_lines.append(line)
+        json_str = '\n'.join(cleaned_lines)
+
         # Fix common quote escaping issues in evidence_spans
         # This is a heuristic - if we detect unescaped quotes in string values, try to fix
         # Note: This is a best-effort repair and may not handle all cases
         return json_str
+
+    def _repair_json(self, raw: str) -> list | None:
+        """Attempt multiple JSON repair strategies, return parsed list or None."""
+        # Strategy 1: try json_repair library if available
+        try:
+            import json_repair  # type: ignore
+            repaired = json_repair.repair_json(raw)
+            result = json.loads(repaired)
+            if isinstance(result, list):
+                logger.info("JSON repair succeeded via json_repair library")
+                return result
+        except (ImportError, Exception):
+            pass
+
+        # Strategy 2: extract array brackets and retry
+        if '[' in raw and ']' in raw:
+            try:
+                start = raw.find('[')
+                end = raw.rfind(']') + 1
+                candidate = raw[start:end]
+                result = json.loads(candidate)
+                if isinstance(result, list):
+                    logger.info("JSON repair succeeded via bracket extraction")
+                    return result
+            except Exception:
+                pass
+
+        # Strategy 3: find the last complete JSON object using brace counting
+        try:
+            brace_count = 0
+            last_complete_idx = -1
+            in_string = False
+            escape_next = False
+            for i, char in enumerate(raw):
+                if escape_next:
+                    escape_next = False
+                    continue
+                if char == '\\' and in_string:
+                    escape_next = True
+                    continue
+                if char == '"' and not escape_next:
+                    in_string = not in_string
+                if in_string:
+                    continue
+                if char == '{':
+                    brace_count += 1
+                elif char == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        last_complete_idx = i
+
+            if last_complete_idx > 0:
+                truncated = raw[:last_complete_idx + 1]
+                array_start = raw.find('[')
+                if array_start >= 0 and array_start < last_complete_idx:
+                    truncated = raw[array_start:last_complete_idx + 1]
+                    truncated = truncated.rstrip(',').rstrip()
+                    if not truncated.endswith(']'):
+                        truncated += ']'
+                else:
+                    truncated = '[' + truncated + ']'
+                result = json.loads(truncated)
+                if isinstance(result, list):
+                    logger.info("JSON repair succeeded via brace counting (recovered %d objects)", len(result))
+                    return result
+        except Exception:
+            pass
+
+        # Strategy 4: extract individual JSON objects one by one
+        try:
+            objects = []
+            depth = 0
+            start_idx = None
+            in_str = False
+            esc = False
+            for i, ch in enumerate(raw):
+                if esc:
+                    esc = False
+                    continue
+                if ch == '\\' and in_str:
+                    esc = True
+                    continue
+                if ch == '"':
+                    in_str = not in_str
+                if in_str:
+                    continue
+                if ch == '{':
+                    if depth == 0:
+                        start_idx = i
+                    depth += 1
+                elif ch == '}':
+                    depth -= 1
+                    if depth == 0 and start_idx is not None:
+                        obj_str = raw[start_idx:i + 1]
+                        try:
+                            obj = json.loads(obj_str)
+                            objects.append(obj)
+                        except Exception:
+                            pass
+                        start_idx = None
+            if objects:
+                logger.info("JSON repair succeeded via object-by-object extraction (%d objects)", len(objects))
+                return objects
+        except Exception:
+            pass
+
+        return None
 
     def _is_listing_page(self, data: dict, page_text: str) -> bool:
         """Detect if the page is a scholarship listing/aggregator page.
@@ -169,19 +288,14 @@ class SourceAuditorAgent:
             "scholarships & resources",
             "find scholarships",
             "scholarship database",
-            "directory",
-            "list of",
             "scholarship finder",
             "search scholarships",
             "online master's degrees",
-            "graduate programs",
             "masters portal",
             "phd portal",
             "find a masters",
             "find a phd",
             "scholarship positions",
-            "opportunities for",
-            "scholarships for"
         ]
         
         # Check name for listing indicators
@@ -224,7 +338,8 @@ class SourceAuditorAgent:
 
         Returns a dict with verified opportunities list.
         """
-        candidate = mapper_state["candidate"]
+        raw = mapper_state["candidate"]
+        candidate = raw if isinstance(raw, Candidate) else Candidate.model_validate(raw)
         run_id = mapper_state["run_id"]
 
         try:
@@ -241,7 +356,7 @@ class SourceAuditorAgent:
             return {"verified_opps": opportunities}
 
         except Exception as exc:
-            logger.debug("Mapper failed for %s: %s", candidate.canonical_url, exc)
+            logger.warning("Mapper failed for %s: %s", getattr(candidate, "canonical_url", "?"), exc)
             return {"verified_opps": []}
 
     async def run(self, state: SwarmState, bus: EventBus) -> SwarmState:
@@ -439,7 +554,7 @@ class SourceAuditorAgent:
                 continue
             
             # Skip if it looks like a listing/search page
-            skip_keywords = ['search', 'list', 'all', 'index', 'browse', 'results', '?', '&']
+            skip_keywords = ['/search', '/browse', '/results']
             if any(kw in url.lower() for kw in skip_keywords):
                 continue
             
@@ -506,16 +621,9 @@ class SourceAuditorAgent:
             except json.JSONDecodeError as json_err:
                 # Try to fix common JSON issues: unescaped quotes in strings
                 logger.warning("Initial JSON parse failed, attempting repair: %s", json_err)
-                try:
-                    # Simple repair: try to extract just the array content
-                    if '[' in raw and ']' in raw:
-                        start = raw.find('[')
-                        end = raw.rfind(']') + 1
-                        raw = raw[start:end]
-                    extracted = json.loads(raw)
-                except Exception as repair_err:
-                    logger.error("JSON repair failed: %s", repair_err)
-                    # Log the problematic content for debugging
+                extracted = self._repair_json(raw)
+                if extracted is None:
+                    logger.error("JSON repair failed: Could not find complete JSON structure")
                     logger.debug("Problematic JSON (first 500 chars): %s", raw[:500])
                     return []
                     

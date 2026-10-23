@@ -490,6 +490,9 @@ class SwarmState(BaseModel):
     # PIIVault reference for rehydration (stored as vault_id string)
     vault_reference: str = ""
 
+    # Cache bypass flag for advanced search
+    force_refresh: bool = False
+
     # Agent 2 output
     search_plans: list[SearchPlan] = Field(default_factory=list)
     candidates: list[Candidate] = Field(default_factory=list)

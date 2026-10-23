@@ -3,9 +3,9 @@
 Graph topology (architecture §1.2):
     INTAKE → A1 (ProfileEnricher) → A2 (OpportunityScout)
            → R1 (routing: enough candidates?) → [retry A2 | A3 (SourceAuditor)]
-           → A3 → R2 (routing: Phase A deadline?) → A4 (RankingStrategist)
-           → A4 → PHASE_A_READY event → R3 (routing: SOP needed?) → A5 (ApplicationStrategist)
-           → A5 → END
+           → A3 (wave fetch + listing expansion) → R2 (enough verified opps?)
+           → A4 (RankingStrategist) → PHASE_A_READY → R3 (SOP needed?)
+           → A5 (ApplicationStrategist) → END
 
 Routing predicates R1, R2, R3 are pure deterministic Python functions — no LLM.
 
@@ -22,7 +22,6 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from langgraph.graph import END, StateGraph
-from langgraph.types import Send
 
 from scholarship_finder.domain.models import (
     Event,
@@ -38,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 # Minimum candidates before skipping the retry round
 # Hackathon requirement: find at least 10 opportunities
-_MIN_CANDIDATES_BEFORE_RETRY = 8   # Reduced to allow proceeding with fewer candidates
+_MIN_CANDIDATES_BEFORE_RETRY = 10  # Challenge spec: find at least 10 opportunities
 # Minimum verified opportunities to proceed to ranking
 _MIN_OPPORTUNITIES = 1            # Allow proceeding with 1 opportunity for demo purposes
 
@@ -50,36 +49,10 @@ def _r1_enough_candidates(state: SwarmState) -> str:
     n = len(state.candidates)
     retry_count = state.run_meta.retry_count
     if n >= _MIN_CANDIDATES_BEFORE_RETRY or retry_count >= state.run_meta.max_retries:
-        logger.debug("R1: %d candidates, proceeding to source_auditor", n)
+        logger.info("R1: %d candidates, proceeding to source_auditor", n)
         return "source_auditor"
     logger.info("R1: only %d candidates, triggering retry round", n)
     return "retry_scout"
-
-
-# ── Fan-out function for Send API (Phase 2.1) ─────────────────────────────────
-
-def _fan_out_candidates(state: SwarmState) -> list[Send]:
-    """Fan out candidates to parallel mapper nodes using Send API.
-
-    Conservative: limit to first 15 candidates to control concurrency.
-    """
-    from scholarship_finder.agents.source_auditor import MapperState
-
-    # Limit candidates for conservative concurrency (Phase 2.1)
-    candidates_to_process = state.candidates[:15]
-
-    logger.info("Fan-out: dispatching %d candidates to parallel mappers", len(candidates_to_process))
-
-    return [
-        Send(
-            "candidate_mapper",
-            MapperState(
-                candidate=candidate,
-                run_id=state.run_meta.run_id,
-            )
-        )
-        for candidate in candidates_to_process
-    ]
 
 
 def _r2_has_opportunities(state: SwarmState) -> str:
@@ -112,6 +85,7 @@ def make_graph(
     github_username: str | None = None,
     vault=None,
     is_replay: bool = False,
+    force_refresh: bool = False,
 ) -> Callable[[SwarmState], Any]:
     """Build and compile the LangGraph StateGraph. Returns a runnable coroutine factory."""
 
@@ -143,45 +117,6 @@ def make_graph(
         ))
         return await opportunity_scout_agent.run(state, bus)
 
-    # ── Fan-out node for Send API (Phase 2.1) ─────────────────────────────────────
-    async def node_fan_out(state: SwarmState) -> SwarmState:
-        """Fan-out node: just passes state for Send API routing."""
-        return state
-
-    # ── Mapper node for Send API (Phase 2.1) ─────────────────────────────────────
-    async def node_candidate_mapper(mapper_state: dict) -> dict:
-        """Mapper node: fetch and verify a single candidate."""
-        from scholarship_finder.agents.source_auditor import MapperState
-        typed_state = MapperState(**mapper_state)
-        result = await source_auditor_agent.fetch_and_verify_candidate(typed_state, bus)
-        return result
-
-    # ── Reducer node for Send API (Phase 2.1) ─────────────────────────────────────
-    async def node_aggregate_opportunities(state: SwarmState) -> SwarmState:
-        """Reducer node: aggregate verified_opps from mappers into opportunities."""
-        # Merge verified_opps into opportunities using reducer
-        if state.verified_opps:
-            new_state = state.model_copy(deep=True)
-            new_state.opportunities = state.opportunities + state.verified_opps
-            # Clear temporary field
-            new_state.verified_opps = []
-
-            await bus.publish(Event(
-                run_id=state.run_meta.run_id,
-                seq=0,
-                timestamp=datetime.now(timezone.utc),
-                node="aggregate_opportunities",
-                severity=EventSeverity.INFO,
-                kind=EventKind.PROGRESS,
-                payload={
-                    "total_opportunities": len(new_state.opportunities),
-                },
-            ))
-
-            return new_state
-        return state
-
-    # ── Fallback: original source_auditor for when Send API is not used ─────────────
     async def node_source_auditor(state: SwarmState) -> SwarmState:
         return await source_auditor_agent.run(state, bus)
 
@@ -246,11 +181,6 @@ def make_graph(
     builder.add_node("profile_enricher", node_profile_enricher)
     builder.add_node("opportunity_scout", node_opportunity_scout)
     builder.add_node("retry_scout", node_retry_scout)
-    # Phase 2.1: Add fan-out, mapper and reducer nodes for Send API
-    builder.add_node("fan_out", node_fan_out)
-    builder.add_node("candidate_mapper", node_candidate_mapper)
-    builder.add_node("aggregate_opportunities", node_aggregate_opportunities)
-    # Keep original source_auditor as fallback
     builder.add_node("source_auditor", node_source_auditor)
     builder.add_node("ranking_strategist", node_ranking_strategist)
     builder.add_node("application_strategist", node_application_strategist)
@@ -263,27 +193,18 @@ def make_graph(
     # Linear edges
     builder.add_edge("profile_enricher", "opportunity_scout")
 
-    # R1: enough candidates? - Route to Send API fan-out or retry
+    # R1: enough candidates? Retry scout once, then audit pages in waves
+    # (wave fetch follows listing-page links; per-URL mappers dropped those pages).
     builder.add_conditional_edges(
         "opportunity_scout",
         _r1_enough_candidates,
-        {"source_auditor": "fan_out", "retry_scout": "retry_scout"},
+        {"source_auditor": "source_auditor", "retry_scout": "retry_scout"},
     )
-    builder.add_edge("retry_scout", "fan_out")
-
-    # Fan-out to parallel mappers using Send API (Phase 2.1)
-    builder.add_conditional_edges(
-        "fan_out",
-        _fan_out_candidates,
-        {"candidate_mapper": "candidate_mapper"},
-    )
-
-    # All mappers converge to reducer
-    builder.add_edge("candidate_mapper", "aggregate_opportunities")
+    builder.add_edge("retry_scout", "source_auditor")
 
     # R2: has opportunities?
     builder.add_conditional_edges(
-        "aggregate_opportunities",
+        "source_auditor",
         _r2_has_opportunities,
         {"ranking_strategist": "ranking_strategist", "degraded_end": "degraded_end"},
     )

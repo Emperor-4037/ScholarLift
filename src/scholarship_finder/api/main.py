@@ -16,6 +16,20 @@ from scholarship_finder.api.routes import router, set_app
 
 logger = logging.getLogger(__name__)
 
+# Cursor's browser (and Chrome DevTools) probe local servers for a CDP
+# endpoint at GET /json/version. That is not an application route; without
+# handling it, uvicorn logs a 404 on every editor refresh.
+_DEVTOOLS_PROBE_MARKERS = (" /json/version ", " /json/list ", " /json HTTP")
+
+
+class _DropDevtoolsAccessLogs(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        return not any(marker in message for marker in _DEVTOOLS_PROBE_MARKERS)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -23,6 +37,7 @@ async def lifespan(app: FastAPI):
 
     Non-breaking addition - builds gateway on startup.
     """
+    logging.getLogger("uvicorn.access").addFilter(_DropDevtoolsAccessLogs())
     logger.info("FastAPI app starting up")
     # Build gateway on startup
     app.state.gateway = build_gateway()
@@ -50,6 +65,21 @@ app.add_middleware(
 # Include API routes (non-breaking addition)
 set_app(app)
 app.include_router(router, prefix="/api")
+
+
+@app.get("/json/version")
+async def json_version():
+    """Answer DevTools version probes and expose the app version.
+
+    Returning 200 with ordinary app metadata (no webSocketDebuggerUrl)
+    stops Cursor/Chrome from treating this process as a debug target
+    while also removing the 404 from the access log.
+    """
+    return {
+        "name": app.title,
+        "version": app.version,
+        "description": app.description,
+    }
 
 # Mount static files (non-breaking addition)
 static_dir = os.path.join(os.path.dirname(__file__), "..", "web", "static")

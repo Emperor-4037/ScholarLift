@@ -46,6 +46,10 @@ def _map_error(exc: Exception, model: str) -> Exception:
     msg = str(exc)
     exc_type = type(exc).__name__
 
+    # Handle empty/unknown errors as transient (likely 503 with empty response)
+    if not msg or msg.strip() == "":
+        return TransientError(PROVIDER, f"Transient error on {model}: empty response")
+
     # Resource exhausted / rate limit
     if "RESOURCE_EXHAUSTED" in msg or "429" in msg:
         # Try to parse retry-after hint
@@ -79,7 +83,8 @@ def _map_error(exc: Exception, model: str) -> Exception:
     if "UNAVAILABLE" in msg or "503" in msg or "502" in msg:
         return TransientError(PROVIDER, f"Transient error on {model}: {msg}")
 
-    return UnknownAdapterError(PROVIDER, f"Unexpected error on {model}: {msg}", exc)
+    # Default to transient for unknown errors (likely service issues)
+    return TransientError(PROVIDER, f"Transient error on {model}: {msg}")
 
 
 class GeminiAdapter:
@@ -292,8 +297,8 @@ class GeminiLLMAdapter:
                 models = self._settings.vision_models()
             else:
                 models = self._settings.fast_models()
-            model = models[0] if models else "gemini-3.5-flash-lite"
-        model = model or "gemini-3.5-flash-lite"
+            model = models[0] if models else "gemini-3.6-flash"
+        model = model or "gemini-3.6-flash"
         cache_key = f"{model}:{tier.value}"
         if cache_key not in self._adapters:
             self._adapters[cache_key] = GeminiAdapter(
@@ -302,22 +307,22 @@ class GeminiLLMAdapter:
         return self._adapters[cache_key]
 
     async def complete(self, spec: TaskSpec) -> LLMResult:
-        """Try models in chain with fallback on quota errors."""
+        """Try models in chain with fallback on transient/quota errors."""
         if not self._settings:
             # No settings - use default behavior
             adapter = self._get_adapter(spec.tier)
             return await adapter.complete(spec)
-        
-        # Get model chain for this tier
+
+        # Get model chain for this tier - filter to only Gemini models
         if spec.tier == LLMTier.REASONING:
-            models = self._settings.reasoning_models()
+            models = [m for m in self._settings.reasoning_models() if m.startswith("gemini")]
         elif spec.tier == LLMTier.VISION:
-            models = self._settings.vision_models()
+            models = [m for m in self._settings.vision_models() if m.startswith("gemini")]
         else:
-            models = self._settings.fast_models()
-        
-        models = models or ["gemini-3.5-flash-lite"]
-        
+            models = [m for m in self._settings.fast_models() if m.startswith("gemini")]
+
+        models = models or ["gemini-3.6-flash"]
+
         # Try each model in the chain
         last_error = None
         for model in models:
@@ -325,38 +330,57 @@ class GeminiLLMAdapter:
                 adapter = self._get_adapter(spec.tier, model)
                 return await adapter.complete(spec)
             except Exception as exc:
-                from scholarship_finder.errors import QuotaExhaustedError, AdapterError
+                from scholarship_finder.errors import (
+                    QuotaExhaustedError, AdapterError, TransientError as SFTransientError,
+                    ModelUnavailableError, RateLimitedError,
+                )
                 last_error = exc
-                if isinstance(exc, (QuotaExhaustedError, AdapterError)):
+                if isinstance(exc, (QuotaExhaustedError, ModelUnavailableError)):
+                    # These errors mean this model is permanently unavailable - skip to next
+                    logger.warning("Model %s unavailable/exhausted, trying next in chain: %s", model, exc)
+                    continue
+                elif isinstance(exc, (SFTransientError, RateLimitedError)):
+                    # Transient errors: try once more after brief wait, then fall through to next model
+                    logger.warning("Model %s transient error, retrying once: %s", model, exc)
+                    try:
+                        await asyncio.sleep(2.0)  # Brief backoff for 503s
+                        adapter2 = self._get_adapter(spec.tier, model)
+                        return await adapter2.complete(spec)
+                    except Exception as exc2:
+                        logger.warning("Model %s retry also failed, trying next in chain: %s", model, exc2)
+                        last_error = exc2
+                        continue
+                elif isinstance(exc, AdapterError):
+                    # Other adapter errors - fall through to next model
                     logger.warning("Model %s failed, trying next in chain: %s", model, exc)
                     continue
-                # For other errors, don't retry - let them propagate
+                # For non-adapter errors, propagate
                 raise
-        
+
         # All models failed
         if last_error:
             raise last_error
         raise RuntimeError("No models available in chain")
 
     async def stream(self, spec: TaskSpec) -> AsyncIterator[str]:
-        """Try models in chain with fallback on quota errors."""
+        """Try models in chain with fallback on transient/quota errors."""
         if not self._settings:
             # No settings - use default behavior
             adapter = self._get_adapter(spec.tier)
             async for chunk in adapter.stream(spec):
                 yield chunk
             return
-        
-        # Get model chain for this tier
+
+        # Get model chain for this tier - filter to only Gemini models
         if spec.tier == LLMTier.REASONING:
-            models = self._settings.reasoning_models()
+            models = [m for m in self._settings.reasoning_models() if m.startswith("gemini")]
         elif spec.tier == LLMTier.VISION:
-            models = self._settings.vision_models()
+            models = [m for m in self._settings.vision_models() if m.startswith("gemini")]
         else:
-            models = self._settings.fast_models()
-        
-        models = models or ["gemini-3.5-flash-lite"]
-        
+            models = [m for m in self._settings.fast_models() if m.startswith("gemini")]
+
+        models = models or ["gemini-3.6-flash"]
+
         # Try each model in the chain
         last_error = None
         for model in models:
@@ -366,14 +390,18 @@ class GeminiLLMAdapter:
                     yield chunk
                 return  # Success - exit iterator
             except Exception as exc:
-                from scholarship_finder.errors import QuotaExhaustedError, AdapterError
+                from scholarship_finder.errors import (
+                    QuotaExhaustedError, AdapterError, TransientError as SFTransientError,
+                    ModelUnavailableError, RateLimitedError,
+                )
                 last_error = exc
-                if isinstance(exc, (QuotaExhaustedError, AdapterError)):
+                if isinstance(exc, (QuotaExhaustedError, ModelUnavailableError, SFTransientError,
+                                    RateLimitedError, AdapterError)):
                     logger.warning("Model %s failed during stream, trying next in chain: %s", model, exc)
                     continue
-                # For other errors, don't retry - let them propagate
+                # For non-adapter errors, propagate
                 raise
-        
+
         # All models failed
         if last_error:
             raise last_error

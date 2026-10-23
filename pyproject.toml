@@ -25,6 +25,7 @@ dependencies = [
     "aiofiles>=24.1",
     "anyio>=4.6",
     "jinja2>=3.1.0",              # HTML templates for FastAPI UI
+    "json-repair>=0.30",          # Robust LLM JSON output repair
 ]
 
 [project.scripts]

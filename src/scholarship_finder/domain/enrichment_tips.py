@@ -36,19 +36,19 @@ def generate_enrichment_tips(profile: CandidateProfile) -> list[EnrichmentTip]:
     tips: list[EnrichmentTip] = []
 
     # Education analysis
-    tips.extend(_analyze_education(profile.education))
+    tips.extend(_analyze_education(profile.education if profile.education else []))
 
     # Skills analysis
-    tips.extend(_analyze_skills(profile.skills))
+    tips.extend(_analyze_skills(profile.skills if profile.skills else []))
 
     # Projects analysis
-    tips.extend(_analyze_projects(profile.projects))
+    tips.extend(_analyze_projects(profile.projects if profile.projects else []))
 
     # Language test analysis
-    tips.extend(_analyze_language_tests(profile.language_tests))
+    tips.extend(_analyze_language_tests(profile.language_tests if profile.language_tests else []))
 
     # Preferences analysis
-    tips.extend(_analyze_preferences(profile.preferences))
+    tips.extend(_analyze_preferences(profile.preferences if profile.preferences else None))
 
     # GitHub signals analysis - pass completeness flags for accurate detection
     tips.extend(_analyze_github_signals(profile.github_signals, profile.completeness_flags))
@@ -251,6 +251,16 @@ def _analyze_language_tests(language_tests: list[Any]) -> list[EnrichmentTip]:
 def _analyze_preferences(preferences: Any) -> list[EnrichmentTip]:
     """Analyze preferences for enrichment opportunities."""
     tips: list[EnrichmentTip] = []
+
+    if not preferences:
+        tips.append(EnrichmentTip(
+            category="preferences",
+            severity="high",
+            message="Specify target countries and fields of study",
+            context="Preferences enable better scholarship matching and program recommendations",
+            priority=8,
+        ))
+        return tips
 
     if not preferences.countries and not preferences.target_fields:
         tips.append(EnrichmentTip(

@@ -205,10 +205,10 @@ class ProfileEnricherAgent:
             kind=EventKind.NODE_COMPLETED,
             payload={
                 "node": "profile_enricher",
-                "education_count": len(profile.education),
-                "skills_count": len(profile.skills),
-                "projects_count": len(profile.projects),
-                "has_gpa": any(e.normalized_gpa for e in profile.education),
+                "education_count": len(profile.education) if profile.education else 0,
+                "skills_count": len(profile.skills) if profile.skills else 0,
+                "projects_count": len(profile.projects) if profile.projects else 0,
+                "has_gpa": any(e.normalized_gpa for e in profile.education) if profile.education else False,
                 "has_github": profile.github_signals is not None,
             },
         ))
@@ -320,6 +320,8 @@ class ProfileEnricherAgent:
 
     def _normalize_gpas(self, profile: CandidateProfile) -> CandidateProfile:
         """Apply GPA normalization strategies in-place."""
+        if not profile.education:
+            return profile
         for edu in profile.education:
             if edu.cgpa_value is not None and edu.cgpa_scale is not None:
                 try:
@@ -371,13 +373,13 @@ class ProfileEnricherAgent:
         """Set completeness_flags for downstream gap analysis."""
         flags = {
             "has_education": bool(profile.education),
-            "has_gpa": any(e.cgpa_value is not None for e in profile.education),
-            "has_normalized_gpa": any(e.normalized_gpa for e in profile.education),
+            "has_gpa": any(e.cgpa_value is not None for e in profile.education) if profile.education else False,
+            "has_normalized_gpa": any(e.normalized_gpa for e in profile.education) if profile.education else False,
             "has_skills": bool(profile.skills),
             "has_projects": bool(profile.projects),
             "has_language_test": bool(profile.language_tests),
-            "has_preferences": bool(profile.preferences.countries or profile.preferences.target_fields),
-            "has_degree_level": bool(profile.preferences.degree_level),
+            "has_preferences": bool(profile.preferences and (profile.preferences.countries or profile.preferences.target_fields)),
+            "has_degree_level": bool(profile.preferences and profile.preferences.degree_level),
             "has_github": profile.github_signals is not None or github_username is not None,
         }
         profile.completeness_flags = flags

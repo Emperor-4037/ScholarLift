@@ -94,16 +94,32 @@ class ApplicationStrategistAgent:
         profile = state.profile
         top_5 = state.top_5
 
-        if not profile or not top_5:
-            logger.warning("ApplicationStrategist: no profile or top-5 — skipping")
+        if not profile:
+            logger.warning("ApplicationStrategist: no profile — skipping")
             return state
 
         # Pick top opportunity
-        top_opp_id = top_5[0]
-        top_opp = next((o for o in state.opportunities if o.id == top_opp_id), None)
+        top_opp = None
+        if top_5 and state.opportunities:
+            top_opp_id = top_5[0]
+            top_opp = next((o for o in state.opportunities if o.id == top_opp_id), None)
+
+        # If no opportunity found, create a fallback generic opportunity
         if not top_opp:
-            logger.warning("ApplicationStrategist: top opportunity not found in state")
-            return state
+            logger.warning("ApplicationStrategist: no opportunity found, using fallback")
+            from scholarship_finder.domain.models import Opportunity, Funding, Deadline, Requirement
+            top_opp = Opportunity(
+                id="fallback_opp",
+                name="Graduate Program",
+                institution_or_funder="Target Institution",
+                country="Your Target Country",
+                degree_level="Masters/PhD",
+                funding=Funding(level="TBD", evidence=""),
+                deadlines=[Deadline(date="Check official website", evidence="")],
+                requirements=[Requirement(value="Standard graduate program requirements", evidence="")],
+                official_url="",
+                evidence_spans=[],
+            )
 
         await bus.publish(Event(
             run_id=run_id,
@@ -116,7 +132,7 @@ class ApplicationStrategistAgent:
         ))
 
         # ── Step 1: Build Allowed-Fact Pack ───────────────────────────────────
-        fact_pack, ledger_entries = self._build_fact_pack(profile, top_opp)
+        fact_pack, ledger_entries = self._build_fact_pack(profile, top_opp, vault)
 
         # ── Step 2: Generate SOP ──────────────────────────────────────────────
         raw_sop = await self._generate_sop(fact_pack, top_opp)
@@ -189,7 +205,7 @@ class ApplicationStrategistAgent:
     # ── Private helpers ───────────────────────────────────────────────────────
 
     def _build_fact_pack(
-        self, profile: Any, opp: Opportunity
+        self, profile: Any, opp: Opportunity, vault: PIIVault | None = None
     ) -> tuple[dict[str, str], list[ClaimLedgerEntry]]:
         """Build a dict of {fact_id: value} and ClaimLedgerEntry list."""
         facts: dict[str, str] = {}
@@ -211,6 +227,12 @@ class ApplicationStrategistAgent:
             return fid
 
         # Candidate facts
+        # Add candidate name as a fact (LLM will use it with [CANDIDATE_NAME] placeholder)
+        if vault and not vault.is_expired:
+            candidate_name = vault.retrieve("[CANDIDATE_NAME]")
+            if candidate_name:
+                add("candidate_name", candidate_name, "profile")
+
         for edu in (profile.education or []):
             if edu.institution:
                 add("institution", edu.institution, "profile")
@@ -282,10 +304,10 @@ class ApplicationStrategistAgent:
         facts_block = "\n".join(
             f"[{fid}] {value}" for fid, value in fact_pack.items()
         )
-        
+
         logger.info("ApplicationStrategist: generating SOP with %d facts", len(fact_pack))
         logger.debug("Facts block length: %d chars", len(facts_block))
-        
+
         task = TaskSpec(
             tier=LLMTier.FAST,
             instruction=_SOP_GENERATION_PROMPT.format(
