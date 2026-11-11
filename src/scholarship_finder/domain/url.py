@@ -72,7 +72,8 @@ def extract_domain(url: str) -> str:
     if host.startswith("www."):
         host = host[4:]
     # Strip port if present
-    return host.split(":")[0]
+    parts = host.split(":")
+    return parts[0] if parts else ""
 
 
 def is_same_domain(url1: str, url2: str) -> bool:

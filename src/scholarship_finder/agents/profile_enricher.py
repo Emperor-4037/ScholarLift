@@ -1,397 +1,251 @@
-"""Agent 1: Profile Enricher
+"""Agent 1: Profile Enricher — documents + form -> CandidateProfile.
 
-Responsibilities (architecture §1.3, Agent 1):
-|- Parse scrubbed resume text → structured CandidateProfile via LLM (fast tier)
-|- Optionally fetch GitHub signals (ProfileSourcePort) → ProfileSignals
-|- Normalize GPA using deterministic strategies
-|- Compute completeness flags
-|- Return updated SwarmState with profile set
-
-LLM task spec: discipline-agnostic prompt; output is structured JSON validated
-against CandidateProfile schema. One repair attempt on SchemaViolationError.
-
-DEC-1 enforcement: fast tier only; reasoning tier NOT used here.
+One FAST complete_json over labelled docs (<=9,000 chars total), explicit
+field schema. Deterministic merge: form values override extraction;
+field_sources recorded. GitHub signals -> projects(source=github) + skills.
+Fallback: form-only + regex GPA/test scores. Never crashes on LLM outage.
 """
 from __future__ import annotations
 
-import asyncio
-import json
 import logging
-from datetime import datetime, timezone
+import re
 from typing import Any
 
 from scholarship_finder.domain.gpa import normalize_gpa
 from scholarship_finder.domain.models import (
     CandidateProfile,
-    Education,
-    Event,
-    EventKind,
-    EventSeverity,
-    LanguageTest,
-    LLMTier,
     NormalizedGPA,
-    Preferences,
     Project,
     SwarmState,
 )
-from scholarship_finder.domain.reducers import reduce_profile
+from scholarship_finder.engine.context import emit
 from scholarship_finder.engine.event_bus import EventBus
 from scholarship_finder.ports.llm import LLMPort, TaskSpec
-from scholarship_finder.ports.profile_source import ProfileSourcePort
+from scholarship_finder.domain.models import LLMTier
+from scholarship_finder.ports.profile_source import ProfileSourcePort, ProfileSourceQuery
 
 logger = logging.getLogger(__name__)
 
-# ── Prompt (discipline-agnostic) ──────────────────────────────────────────────
+_MAX_DOC_CHARS = 9000
+_GPA_RE = re.compile(r"(?:gpa|cgpa|grade|score)[:\s]*([0-9]+(?:\.[0-9]+)?)\s*/\s*([0-9]+(?:\.[0-9]+)?)", re.I)
+_TEST_RE = re.compile(r"\b(ielts|toefl|pte|duolingo|gre|gmat)\b[^\d]{0,15}([0-9]{2,3}(?:\.[0-9])?)", re.I)
 
-_EXTRACT_PROFILE_PROMPT = """\
-You are a structured data extractor. Extract a candidate's academic and \
-professional profile from the provided resume/CV text.
-
-Return ONLY valid JSON matching this schema (no markdown, no explanation):
-|{
-  "education": [
-    {
-      "degree": "<string: e.g. Bachelor of Engineering, Master of Science>",
-      "field": "<string: e.g. Computer Science, Mechanical Engineering>",
-      "institution": "<string: university/college name>",
-      "cgpa_value": <float or null>,
-      "cgpa_scale": <float or null>
-    }
-  ],
-  "skills": ["<string>", ...],
-  "projects": [
-    {
-      "title": "<string>",
-      "summary": "<string, 1-2 sentences>",
-      "technologies": ["<string>", ...]
-    }
-  ],
-  "language_tests": [
-    {
-      "test_name": "<string: IELTS/TOEFL/GRE/GMAT/DELF/other>",
-      "overall_score": <float or null>
-    }
-  ],
-  "preferences": {
-    "countries": ["<string>", ...],
-    "degree_level": "<string: masters/phd/bachelors/postdoc>",
-    "target_fields": ["<string>", ...],
-    "funding_required": <bool>
-  },
-  "github_username": "<string or null: GitHub username if found in URLs>"
-}
-
-Extraction Rules:
-1. Extract ONLY information EXPLICITLY stated in the text.
-2. If a field is absent, use null for scalars and [] for arrays.
-3. Do NOT invent values. Do NOT include PII (names, emails, phone numbers).
-4. For education: Look for sections like "Education", "Academic Background", "Qualifications". Extract the degree type, field/major, and institution name. Be thorough - universities may be listed with different headings.
-5. For skills: Extract from dedicated "Skills" sections AND from project descriptions. Include technical skills, tools, programming languages, and domain knowledge.
-6. For projects: Look for sections like "Projects", "Portfolio", "Work Experience" with project details. Extract project names, brief descriptions, and technologies/tools mentioned.
-7. For language tests: Look for IELTS, TOEFL, GRE, GMAT, DELF, PTE, Duolingo scores with numeric values.
-8. For preferences: Infer from objective statements, cover letter excerpts, or explicit "Looking for" sections. Countries may be mentioned in location preferences or target universities.
-9. For github_username: Look for GitHub URLs (github.com/username) in contact info, project links, or social media sections. Extract the username (the part after github.com/).
-10. degree_level should reflect the NEXT degree the candidate seeks (infer from "Objective", "Goal", or stated intentions).
-11. For cgpa_scale: Use 4.0 for US/Canada, 10.0 for India, 5.0 for German systems, 100.0 for percentage-based grades.
-
-Resume text:
----
-{resume_text}
----
-"""
+_SCHEMA = """Extract a student profile as ONE JSON object with keys:
+nationality, current_country, languages[], current_level,
+education: [{degree, field, institution, level, country, graduation_year,
+  cgpa_value, cgpa_scale, grade_system}],
+skills[], projects: [{title, summary, technologies[], url}],
+research: [{title, kind, venue, year, summary}],
+experience: [{role, organization, kind, duration_months, summary}],
+activities: [{title, role, summary}],
+awards: [{name, year, summary, is_scholarship}],
+language_tests: [{test_name, overall_score}],
+financial_need: {level, annual_budget_usd, context},
+preferences: {countries[], degree_level, target_fields[], funding_required,
+  instruction_languages[], intake}
+Use only information present in the text; omit unknown keys."""
 
 
 class ProfileEnricherAgent:
-    """Agent 1: Parses resume → CandidateProfile, optionally enriches with GitHub."""
-
-    def __init__(
-        self,
-        llm_port: LLMPort,
-        profile_source: ProfileSourcePort | None = None,
-    ) -> None:
+    def __init__(self, llm_port: LLMPort, profile_source: ProfileSourcePort | None = None) -> None:
         self._llm = llm_port
         self._github = profile_source
 
-    async def run(
-        self,
-        state: SwarmState,
-        bus: EventBus,
-        scrubbed_text: str,
-        github_username: str | None = None,
-    ) -> SwarmState:
-        """Enrich state with a structured CandidateProfile.
+    async def run(self, state: SwarmState, bus: EventBus,
+                  scrubbed_text: str = "", github_username: str | None = None) -> SwarmState:
+        intake = state.intake
+        docs = intake.documents
+        profile = intake.form_profile or CandidateProfile()
+        sources: dict[str, str] = dict(profile.field_sources)
+        if intake.form_profile is not None:
+            for k in profile.model_fields_set:
+                sources.setdefault(k, "form")
 
-        Parameters
-        ----------
-        state:
-            Current SwarmState (after Intake).
-        bus:
-            Event bus for progress events.
-        scrubbed_text:
-            PII-scrubbed resume text from the Intake Service.
-        github_username:
-            Optional GitHub handle for signal enrichment.
-
-        Returns
-        -------
-        SwarmState with `profile` set.
-        """
-        run_id = state.run_meta.run_id
-
-        await bus.publish(Event(
-            run_id=run_id,
-            seq=0,
-            timestamp=datetime.now(timezone.utc),
-            node="profile_enricher",
-            severity=EventSeverity.INFO,
-            kind=EventKind.NODE_STARTED,
-            payload={"node": "profile_enricher"},
-        ))
-
-        # ── Step 1: Parallel LLM extraction and GitHub enrichment ────────────
-        # Run LLM extraction and GitHub fetch concurrently to reduce latency
-        logger.debug("ProfileEnricher: starting extraction, github_username input=%s", github_username)
-        llm_task = self._extract_profile(scrubbed_text, run_id)
-        github_task = None
-        if self._github and github_username:
-            logger.info("ProfileEnricher: starting GitHub fetch for username: %s", github_username)
-            github_task = self._enrich_github_base(github_username)
-
-        # Wait for LLM extraction to complete first (needed for GPA normalization)
-        profile, llm_extracted_github = await llm_task
-        logger.debug("ProfileEnricher: LLM extraction complete, extracted_github=%s", llm_extracted_github)
-
-        # Use LLM-extracted GitHub username as fallback if manual input not provided
-        effective_github_username = github_username or llm_extracted_github
-        if llm_extracted_github and not github_username:
-            logger.info("ProfileEnricher: using LLM-extracted GitHub username as fallback: %s", llm_extracted_github)
-
-        # If we now have a GitHub username (from LLM) and didn't start GitHub fetch, start it
-        if effective_github_username and not github_task and self._github:
-            logger.info("ProfileEnricher: starting delayed GitHub fetch for LLM-extracted username: %s", effective_github_username)
-            github_task = self._enrich_github_base(effective_github_username)
-
-        # ── Step 2: GPA normalization ─────────────────────────────────────────
-        profile = self._normalize_gpas(profile)
-
-        # ── Step 3: Merge GitHub enrichment if concurrent task completed ───────
-        if github_task:
+        # ── LLM extraction over labelled documents ──────────────────────────
+        extracted: dict[str, Any] = {}
+        doc_text = self._doc_block(docs, scrubbed_text)
+        if doc_text.strip():
             try:
-                github_signals = await github_task
-                if github_signals is not None:
-                    logger.info("ProfileEnricher: GitHub signals fetched successfully for %s", effective_github_username)
-                    profile.github_signals = github_signals
-                else:
-                    logger.warning("ProfileEnricher: GitHub signals fetch returned None for %s", effective_github_username)
+                res = await self._llm.complete_json(TaskSpec(
+                    tier=LLMTier.FAST, system=_SCHEMA,
+                    prompt=f"Documents:\n{doc_text}",
+                    max_output_tokens=3000, purpose="profile_extraction",
+                ))
+                extracted = res.parsed if isinstance(res.parsed, dict) else {}
             except Exception as exc:
-                logger.warning("GitHub enrichment failed for %s: %s", effective_github_username, exc)
+                emit("profile_enricher", f"LLM extraction failed ({type(exc).__name__}) — using deterministic fallback",
+                     )
+                extracted = {}
+        if not extracted and doc_text.strip():
+            extracted = _regex_extract(doc_text)
 
-        # ── Step 4: Completeness flags ────────────────────────────────────────
-        # Pass effective_github_username to compute_completeness to set has_github flag correctly
-        profile = self._compute_completeness(profile, github_username=effective_github_username)
-        logger.debug("ProfileEnricher: completeness_flags=%s", profile.completeness_flags)
-
-        # ── Step 5: Update state ──────────────────────────────────────────────
-        new_state_dict = state.model_dump()
-        new_state = SwarmState(**new_state_dict)
-        new_state.profile = reduce_profile(state.profile, profile)
-
-        await bus.publish(Event(
-            run_id=run_id,
-            seq=0,
-            timestamp=datetime.now(timezone.utc),
-            node="profile_enricher",
-            severity=EventSeverity.INFO,
-            kind=EventKind.NODE_COMPLETED,
-            payload={
-                "node": "profile_enricher",
-                "education_count": len(profile.education) if profile.education else 0,
-                "skills_count": len(profile.skills) if profile.skills else 0,
-                "projects_count": len(profile.projects) if profile.projects else 0,
-                "has_gpa": any(e.normalized_gpa for e in profile.education) if profile.education else False,
-                "has_github": profile.github_signals is not None,
-            },
-        ))
-
-        return new_state
-
-    # ── Private helpers ───────────────────────────────────────────────────────
-
-    async def _extract_profile(self, scrubbed_text: str, run_id: str) -> tuple[CandidateProfile, str | None]:
-        """Call LLM (fast tier) to parse the resume into structured fields.
-
-        Returns:
-            Tuple of (profile, extracted_github_username)
-        """
-        task = TaskSpec(
-            tier=LLMTier.FAST,
-            instruction=_EXTRACT_PROFILE_PROMPT.replace("{resume_text}", scrubbed_text[:12000]),
-            data_blocks=[],
-            output_schema=None,
-            max_output_tokens=2048,
-        )
-
-        result = await self._llm.complete(task)
-        raw_json = result.content.strip()
-
-        # Strip markdown code fences if present
-        if raw_json.startswith("```"):
-            raw_json = raw_json.split("```")[1]
-            if raw_json.startswith("json"):
-                raw_json = raw_json[4:]
-
+        # ── Merge: form overrides extraction ─────────────────────────────────
         try:
-            data = json.loads(raw_json)
-        except json.JSONDecodeError as exc:
-            logger.warning("Profile extraction: JSON parse error: %s — using empty profile", exc)
-            data = {}
+            merged = _merge(profile, extracted, sources)
+        except Exception as exc:
+            emit("profile_enricher", f"Merging extracted details failed ({type(exc).__name__}) — using your form only")
+            merged = profile.model_copy(deep=True)
 
-        profile = self._dict_to_profile(data)
-
-        # Extract GitHub username from LLM response if available
-        extracted_github = data.get("github_username")
-        if extracted_github and isinstance(extracted_github, str):
-            logger.info("LLM extracted GitHub username: %s", extracted_github)
-        else:
-            extracted_github = None
-
-        return profile, extracted_github
-
-    def _dict_to_profile(self, data: dict[str, Any]) -> CandidateProfile:
-        """Map raw LLM JSON dict → CandidateProfile, tolerating missing/bad fields."""
-        education: list[Education] = []
-        for edu in data.get("education") or []:
+        # ── GitHub signals ───────────────────────────────────────────────────
+        gh = github_username or intake.github_username
+        if gh and self._github is not None:
             try:
-                education.append(Education(
-                    degree=str(edu.get("degree") or ""),
-                    field=str(edu.get("field") or ""),
-                    institution=str(edu.get("institution") or ""),
-                    cgpa_value=_safe_float(edu.get("cgpa_value")),
-                    cgpa_scale=_safe_float(edu.get("cgpa_scale")),
-                    normalized_gpa=None,
-                ))
-            except Exception as exc:
-                logger.debug("Skipping malformed education entry: %s", exc)
+                signals = await self._github.fetch_signals(ProfileSourceQuery(handle=gh))
+                if signals:
+                    merged.github_signals = signals
+                    merged.projects += [Project(
+                        title=p.get("name", ""), summary=p.get("description", ""),
+                        technologies=[t for t in (p.get("topics") or [])] + ([p["language"]] if p.get("language") else []),
+                        url=p.get("url", ""), source="github",
+                    ) for p in (signals.projects or [])[:8]]
+                    for lang in signals.languages or []:
+                        if lang not in merged.skills:
+                            merged.skills.append(lang)
+                    sources.setdefault("projects", "github")
+                    emit("profile_enricher", f"GitHub @{gh}: {len(signals.projects or [])} repos merged")
+            except Exception:
+                pass
 
-        projects: list[Project] = []
-        for proj in data.get("projects") or []:
-            try:
-                import uuid
-                projects.append(Project(
-                    id=str(uuid.uuid4()),
-                    title=str(proj.get("title") or ""),
-                    summary=str(proj.get("summary") or ""),
-                    technologies=[str(t) for t in (proj.get("technologies") or [])],
-                    source="resume",
-                    evidence_ref=None,
-                ))
-            except Exception as exc:
-                logger.debug("Skipping malformed project entry: %s", exc)
-
-        language_tests: list[LanguageTest] = []
-        for lt in data.get("language_tests") or []:
-            try:
-                language_tests.append(LanguageTest(
-                    test_name=str(lt.get("test_name") or ""),
-                    overall_score=_safe_float(lt.get("overall_score")),
-                    component_scores=None,
-                    evidence_ref=None,
-                ))
-            except Exception as exc:
-                logger.debug("Skipping malformed language test entry: %s", exc)
-
-        prefs_raw = data.get("preferences") or {}
-        preferences = Preferences(
-            countries=[str(c) for c in (prefs_raw.get("countries") or [])],
-            degree_level=str(prefs_raw.get("degree_level") or "masters"),
-            target_fields=[str(f) for f in (prefs_raw.get("target_fields") or [])],
-            funding_required=bool(prefs_raw.get("funding_required", True)),
-        )
-
-        return CandidateProfile(
-            education=education,
-            skills=[str(s) for s in (data.get("skills") or [])],
-            projects=projects,
-            language_tests=language_tests,
-            preferences=preferences,
-            completeness_flags={},
-            github_signals=None,
-        )
-
-    def _normalize_gpas(self, profile: CandidateProfile) -> CandidateProfile:
-        """Apply GPA normalization strategies in-place."""
-        if not profile.education:
-            return profile
-        for edu in profile.education:
-            if edu.cgpa_value is not None and edu.cgpa_scale is not None:
+        # ── GPA normalisation + completeness ─────────────────────────────────
+        for edu in merged.education:
+            if edu.cgpa_value is not None and edu.cgpa_scale and not edu.normalized_gpa:
                 try:
-                    if edu.cgpa_scale == 4.0:
-                        target = "passthrough"
-                    elif edu.cgpa_scale == 10.0:
-                        target = "indian_to_us"
-                    elif edu.cgpa_scale == 100.0:
-                        target = "percentage_to_us"
-                    else:
-                        target = "bavarian"
-
-                    result = normalize_gpa(edu.cgpa_value, edu.cgpa_scale, target=target)
-                    edu.normalized_gpa = NormalizedGPA(
-                        value=result.value,
-                        target_scale=result.target_scale,
-                        method=result.method,
-                        confidence=result.confidence,
-                        note=result.note,
-                    )
-                except Exception as exc:
-                    logger.debug("GPA normalization failed for %s/%s: %s", edu.cgpa_value, edu.cgpa_scale, exc)
-        return profile
-
-    async def _enrich_github_base(self, username: str):
-        """Fetch GitHub signals (standalone for parallel execution)."""
-        if self._github is None:
-            logger.debug("GitHub adapter not configured, skipping enrichment")
-            return None
-        from scholarship_finder.ports.profile_source import ProfileSourceQuery
-        query = ProfileSourceQuery(handle=username)
-        signals = await self._github.fetch_signals(query)  # returns ProfileSignals
-        return signals
-
-    async def _enrich_github(
-        self, profile: CandidateProfile, username: str
-    ) -> CandidateProfile:
-        """Fetch GitHub signals and attach to profile."""
-        if self._github is None:
-            logger.debug("GitHub adapter not configured, skipping enrichment")
-            return profile
-        from scholarship_finder.ports.profile_source import ProfileSourceQuery
-        query = ProfileSourceQuery(handle=username)
-        signals = await self._github.fetch_signals(query)  # returns ProfileSignals
-        profile.github_signals = signals
-        return profile
-
-    def _compute_completeness(self, profile: CandidateProfile, github_username: str | None = None) -> CandidateProfile:
-        """Set completeness_flags for downstream gap analysis."""
-        flags = {
-            "has_education": bool(profile.education),
-            "has_gpa": any(e.cgpa_value is not None for e in profile.education) if profile.education else False,
-            "has_normalized_gpa": any(e.normalized_gpa for e in profile.education) if profile.education else False,
-            "has_skills": bool(profile.skills),
-            "has_projects": bool(profile.projects),
-            "has_language_test": bool(profile.language_tests),
-            "has_preferences": bool(profile.preferences and (profile.preferences.countries or profile.preferences.target_fields)),
-            "has_degree_level": bool(profile.preferences and profile.preferences.degree_level),
-            "has_github": profile.github_signals is not None or github_username is not None,
+                    r = normalize_gpa(edu.cgpa_value, edu.cgpa_scale)
+                    edu.normalized_gpa = NormalizedGPA(value=round(r.value, 2), method=r.method)
+                except Exception:
+                    pass
+        merged.field_sources = sources
+        merged.completeness_flags = {
+            "has_education": bool(merged.education),
+            "has_gpa": merged.us_gpa() is not None,
+            "has_skills": len(merged.skills) >= 3,
+            "has_language_test": bool(merged.language_tests),
+            "has_countries": bool(merged.preferences.countries),
+            "has_nationality": bool(merged.nationality),
+            "has_github": merged.github_signals is not None,
         }
-        profile.completeness_flags = flags
-        return profile
+        emit("profile_enricher", _summary(merged))
+        return {"profile": merged}
+
+    def _doc_block(self, docs, scrubbed_text) -> str:
+        if not docs:
+            return (scrubbed_text or "")[:_MAX_DOC_CHARS]
+        pri = {"TRANSCRIPT": 0, "RESUME": 1, "OTHER": 2}
+        ordered = sorted(docs, key=lambda d: pri.get(d.label, 2))
+        out, used = [], 0
+        for d in ordered:
+            chunk = f"--- {d.label}: {d.filename} ---\n{d.text}"
+            if used + len(chunk) > _MAX_DOC_CHARS:
+                chunk = chunk[: _MAX_DOC_CHARS - used]
+            out.append(chunk); used += len(chunk)
+            if used >= _MAX_DOC_CHARS:
+                break
+        return "\n\n".join(out)
 
 
-# ── Utility ───────────────────────────────────────────────────────────────────
-
-def _safe_float(v: Any) -> float | None:
-    if v is None:
-        return None
+def _merge(base: CandidateProfile, ext: dict[str, Any], sources: dict[str, str]) -> CandidateProfile:
+    data = base.model_dump()
+    scalar_fields = ("nationality", "current_country", "current_level")
+    for f in scalar_fields:
+        if not getattr(base, f) and ext.get(f):
+            data[f] = ext[f]; sources.setdefault(f, "document")
+    for f in ("languages", "skills"):
+        extra = [s for s in (ext.get(f) or []) if isinstance(s, str) and s not in data[f]]
+        if extra:
+            data[f] += extra; sources.setdefault(f, "document")
+    list_fields = ("education", "projects", "research", "experience",
+                   "activities", "awards", "language_tests")
+    for f in list_fields:
+        if not data.get(f) and ext.get(f):
+            data[f] = ext[f]; sources.setdefault(f, "document")
+    if ext.get("financial_need") and base.financial_need.level == "unknown":
+        data["financial_need"] = ext["financial_need"]; sources.setdefault("financial_need", "document")
+    prefs = ext.get("preferences") or {}
+    pdata = data["preferences"]
+    for k in ("countries", "target_fields", "instruction_languages"):
+        if k != "target_fields" and pdata[k]:
+            continue        # the student's own destinations/languages are authoritative
+        extra = [c for c in (prefs.get(k) or []) if isinstance(c, str) and c not in pdata[k]]
+        pdata[k] += extra
+        if extra: sources.setdefault("preferences", "document")
+    for k in ("degree_level", "intake"):
+        if not pdata.get(k) and prefs.get(k):
+            pdata[k] = prefs[k]; sources.setdefault("preferences", "document")
+    fr = _as_bool(prefs.get("funding_required"))
+    if fr is not None:
+        pdata["funding_required"] = fr
+    data["preferences"] = pdata
     try:
-        return float(v)
-    except (TypeError, ValueError):
-        return None
+        return CandidateProfile.model_validate(data)
+    except Exception:
+        return _salvage(base, data)
+
+
+def _as_bool(v: Any) -> bool | None:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        return {"true": True, "yes": True, "y": True, "1": True,
+                "false": False, "no": False, "n": False, "0": False}.get(v.strip().lower())
+    return None
+
+
+def _valid(data: dict[str, Any]) -> bool:
+    try:
+        CandidateProfile.model_validate(data)
+        return True
+    except Exception:
+        return False
+
+
+def _salvage(base: CandidateProfile, data: dict[str, Any]) -> CandidateProfile:
+    """One malformed LLM value must never cost the whole profile: keep every
+    field / list item / preference that validates on its own, drop the rest."""
+    good = base.model_dump()
+    for key, val in data.items():
+        if _valid({**good, key: val}):
+            good[key] = val
+        elif isinstance(val, list):
+            items: list[Any] = []
+            for it in val:
+                if _valid({**good, key: items + [it]}):
+                    items.append(it)
+            good[key] = items
+        elif key == "preferences" and isinstance(val, dict):
+            prefs = dict(good["preferences"])
+            for pk, pv in val.items():
+                if _valid({**good, "preferences": {**prefs, pk: pv}}):
+                    prefs[pk] = pv
+            good["preferences"] = prefs
+    return CandidateProfile.model_validate(good)
+
+
+def _regex_extract(text: str) -> dict[str, Any]:
+    ext: dict[str, Any] = {}
+    m = _GPA_RE.search(text)
+    if m:
+        ext["education"] = [{"degree": "", "field": "", "cgpa_value": float(m.group(1)),
+                             "cgpa_scale": float(m.group(2))}]
+    tests = [{"test_name": t.upper(), "overall_score": float(s)}
+             for t, s in _TEST_RE.findall(text)]
+    if tests:
+        ext["language_tests"] = tests
+    return ext
+
+
+def _summary(p: CandidateProfile) -> str:
+    edu = p.primary_education()
+    gpa = p.us_gpa()
+    parts = [b for b in (edu.degree if edu else "", edu.field if edu else "") if b]
+    msg = f"Parsed profile: {', '.join(parts) or 'incomplete'}"
+    if edu and edu.cgpa_value:
+        msg += f", {edu.cgpa_value}/{edu.cgpa_scale}"
+        if gpa:
+            msg += f" (≈{gpa:.2f}/4.0)"
+    if p.projects:
+        msg += f", {len(p.projects)} projects"
+    if p.language_tests:
+        msg += f", {p.language_tests[0].test_name} {p.language_tests[0].overall_score}"
+    if p.preferences.countries:
+        msg += f"; targets {', '.join(p.preferences.countries[:4])}"
+    return msg

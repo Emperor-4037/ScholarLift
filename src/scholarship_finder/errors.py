@@ -197,6 +197,21 @@ class BlockedError(AdapterError):
         return False
 
 
+class LLMUnavailableError(AdapterError):
+    """Every model in the requested tier chain failed or is unavailable.
+
+    Agents catch this and fall back to deterministic behaviour.
+    """
+
+    def __init__(self, provider: str, message: str, attempts: list[str] | None = None) -> None:
+        super().__init__(provider, message)
+        self.attempts = attempts or []
+
+
+class BudgetExceededError(AdapterError):
+    """A per-run budget (LLM calls, search credits) has been used up."""
+
+
 class UnknownAdapterError(AdapterError):
     """Catch-all for unexpected vendor failures.
 

@@ -147,7 +147,7 @@ class BreakerRegistry:
         """Per-domain breaker for Fetch tier anti-bot protection."""
         key = f"fetch/{domain}"
         if key not in self._breakers:
-            self._breakers[key] = CircuitBreaker(key, failure_threshold=1, cooldown_s=60.0)
+            self._breakers[key] = CircuitBreaker(key, failure_threshold=2, cooldown_s=60.0)
         return self._breakers[key]
 
     def all_states(self) -> dict[str, str]:

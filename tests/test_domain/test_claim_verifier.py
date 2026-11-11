@@ -1,7 +1,6 @@
 """Tests for SOP claim-ledger verifier (Stage 2 anti-hallucination)."""
 from __future__ import annotations
 
-import pytest
 
 from scholarship_finder.domain.claim_verifier import (
     ClaimVerificationResult,
@@ -143,3 +142,28 @@ class TestGetFailingIndices:
     def test_all_pass(self):
         results = [ClaimVerificationResult(sentence_index=i, passed=True) for i in range(3)]
         assert get_failing_sentence_indices(results) == []
+
+
+from scholarship_finder.domain.claim_verifier import (
+    parse_cited_ids, strip_citations, verify_sentence_f)
+
+
+def test_f_parse_and_strip():
+    assert parse_cited_ids("Text [F1][F12].") == ["F1", "F12"]
+    assert "[F1]" not in strip_citations("Text [F1].")
+
+
+def test_f_grounded_passes():
+    r = verify_sentence_f("My GPA is 3.8 from IIT Delhi [F1].", {"F1": "GPA 3.8 IIT Delhi"})
+    assert r.passed
+
+
+def test_f_ungrounded_number_and_unknown_id_fail():
+    assert not verify_sentence_f("I scored 99 points [F1].", {"F1": "GPA 3.8"}).passed
+    r = verify_sentence_f("Something [F9].", {"F1": "x"})
+    assert not r.passed and "F9" in r.missing_fact_ids
+
+
+def test_f_uncited_generic_passes_but_number_fails():
+    assert verify_sentence_f("I am deeply motivated.", {"F1": "x"}).passed
+    assert not verify_sentence_f("I scored 99 in school.", {"F1": "x"}).passed

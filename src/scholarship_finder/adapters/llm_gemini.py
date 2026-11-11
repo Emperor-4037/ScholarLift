@@ -1,422 +1,200 @@
-"""Gemini LLM adapter — implements the LLM port using google-genai SDK.
+"""Google Gemini LLM provider — implements the LLMProvider protocol.
 
-Capabilities: structured JSON output, streaming, vision (image parts).
-Tier routing: FAST → flash-lite models; REASONING → flash thinking models; VISION → flash.
-Model IDs come entirely from config — never hardcoded here.
-All vendor errors are translated to the normalized error taxonomy before crossing the port.
+Used for every ``gemini-*`` model in the tier chains (fast, reasoning and
+vision). The :class:`LLMRouter` picks the model; this adapter only knows
+how to talk to the Gemini API.
+
+- ``genai.Client`` instances are cached per running event loop (each run
+  gets its own loop on a background thread).
+- ``json_mode`` → ``response_mime_type="application/json"``.
+- Images in ``TaskSpec.images`` are sent as ``Part.from_bytes`` parts.
+- A modest thinking budget is set for the reasoning tier only.
+- All SDK exceptions are mapped to the normalized error taxonomy.
 """
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import time
-from typing import Any, AsyncIterator
+from typing import Any, Callable
+
+from google import genai
+from google.genai import types
 
 from scholarship_finder.errors import (
+    AdapterError,
     AuthError,
-    ContentBlockedError,
     ContextTooLongError,
     ModelUnavailableError,
     QuotaExhaustedError,
     RateLimitedError,
     RateLimitScope,
-    SchemaViolationError,
-    TimeoutError as SFTimeoutError,
     TransientError,
     UnknownAdapterError,
 )
-from scholarship_finder.ports.llm import LLMResult, LLMUsage, TaskSpec
-from scholarship_finder.domain.models import LLMTier
+from scholarship_finder.ports.llm import LLMResult, LLMUsage, RateInfo, TaskSpec
 
 logger = logging.getLogger(__name__)
 
-try:
-    from google import genai
-    from google.genai import types as genai_types
-    _GENAI_AVAILABLE = True
-except ImportError:
-    _GENAI_AVAILABLE = False
-
 PROVIDER = "gemini"
 
-
-def _map_error(exc: Exception, model: str) -> Exception:
-    """Translate google-genai SDK exceptions → normalized error taxonomy."""
-    msg = str(exc)
-    exc_type = type(exc).__name__
-
-    # Handle empty/unknown errors as transient (likely 503 with empty response)
-    if not msg or msg.strip() == "":
-        return TransientError(PROVIDER, f"Transient error on {model}: empty response")
-
-    # Resource exhausted / rate limit
-    if "RESOURCE_EXHAUSTED" in msg or "429" in msg:
-        # Try to parse retry-after hint
-        retry_after = 0.0
-        if "retryDelay" in msg:
-            import re
-            m = re.search(r'"retryDelay":\s*"(\d+(?:\.\d+)?)s"', msg)
-            if m:
-                retry_after = float(m.group(1))
-        if "quota" in msg.lower() or retry_after == 0.0:
-            return QuotaExhaustedError(PROVIDER, f"Daily quota exhausted for {model}: {msg}")
-        return RateLimitedError(
-            PROVIDER, f"Rate limited on {model}", RateLimitScope.MINUTE, retry_after
-        )
-
-    if "INVALID_ARGUMENT" in msg and "context" in msg.lower():
-        return ContextTooLongError(PROVIDER, f"Context too long for {model}: {msg}")
-
-    if "PERMISSION_DENIED" in msg or "API_KEY_INVALID" in msg or "401" in msg:
-        return AuthError(PROVIDER, f"Auth failed for {model}: {msg}")
-
-    if "404" in msg or "NOT_FOUND" in msg or "deprecated" in msg.lower():
-        return ModelUnavailableError(PROVIDER, f"Model {model} unavailable/retired: {msg}")
-
-    if "SAFETY" in msg or "blocked" in msg.lower():
-        return ContentBlockedError(PROVIDER, f"Content blocked by safety filter: {msg}")
-
-    if "deadline" in msg.lower() or "timeout" in msg.lower() or "DEADLINE_EXCEEDED" in msg:
-        return SFTimeoutError(PROVIDER, f"Timeout on {model}: {msg}")
-
-    if "UNAVAILABLE" in msg or "503" in msg or "502" in msg:
-        return TransientError(PROVIDER, f"Transient error on {model}: {msg}")
-
-    # Default to transient for unknown errors (likely service issues)
-    return TransientError(PROVIDER, f"Transient error on {model}: {msg}")
+# Thinking budget for reasoning-tier calls (gemini-2.5+/3 flash models).
+_THINKING_HEADROOM = 1024
 
 
-class GeminiAdapter:
-    """Gemini LLM adapter via google-genai SDK.
+class GeminiProvider:
+    """Gemini API endpoint for all ``gemini-*`` models.
 
-    One instance per model ID. The LLM router creates and caches these.
+    Args:
+        api_key: Gemini API key (GEMINI_API_KEY).
+        name:    Provider label used in results/telemetry.
     """
 
-    def __init__(self, api_key: str, model_id: str, tier: LLMTier, bus=None) -> None:
-        if not _GENAI_AVAILABLE:
-            raise ImportError("google-genai is not installed. Run: pip install google-genai")
-        self._model_id = model_id
-        self._tier = tier
-        self._client = genai.Client(api_key=api_key)
-        self._bus = bus  # Optional EventBus for error reporting
+    def __init__(self, api_key: str, name: str = PROVIDER) -> None:
+        self.name = name
+        self._api_key = api_key
+        # Clients are bound to the loop that created them — keep one per loop.
+        self._clients: dict[asyncio.AbstractEventLoop, genai.Client] = {}
+        self._rate_observer: Callable[[str, RateInfo | None], None] | None = None
 
-    # ── Port implementation ───────────────────────────────────────────────────
+    # ── Client lifecycle ─────────────────────────────────────────────────────
 
-    async def complete(self, spec: TaskSpec) -> LLMResult:
-        """Execute a structured or plain-text completion."""
+    def _client(self) -> genai.Client:
+        loop = asyncio.get_running_loop()
+        client = self._clients.get(loop)
+        if client is None:
+            client = genai.Client(api_key=self._api_key)
+            self._clients[loop] = client
+        return client
+
+    async def aclose(self) -> None:
+        """Drop the client bound to the current loop (call at run end)."""
+        loop = asyncio.get_running_loop()
+        self._clients.pop(loop, None)
+
+    def set_rate_observer(self, observer: Callable[[str, RateInfo | None], None]) -> None:
+        """Register a callback ``(model, RateInfo|None)`` fed after each call."""
+        self._rate_observer = observer
+
+    # ── Generation ───────────────────────────────────────────────────────────
+
+    async def generate(self, model: str, spec: TaskSpec) -> LLMResult:
+        """One completion call; raises mapped AdapterError subclasses."""
+        client = self._client()
+        contents = self._build_contents(spec)
         config = self._build_config(spec)
-        contents = self._build_contents(spec)
-        t0 = time.monotonic()
+
         try:
-            response = await asyncio.wait_for(
-                asyncio.to_thread(
-                    self._client.models.generate_content,
-                    model=self._model_id,
-                    contents=contents,
-                    config=config,
-                ),
-                timeout=60.0,  # 60 second timeout for LLM calls
+            response = await client.aio.models.generate_content(
+                model=model,
+                contents=contents,
+                config=config,
             )
         except Exception as exc:
-            mapped_error = _map_error(exc, self._model_id)
-            # Publish error event if EventBus is available
-            if self._bus:
-                from scholarship_finder.domain.models import Event, EventKind, EventSeverity
-                from datetime import datetime, timezone
-                try:
-                    await self._bus.publish(Event(
-                        run_id=spec.data_blocks[0].get("run_id", "unknown") if spec.data_blocks else "unknown",
-                        seq=0,
-                        timestamp=datetime.now(timezone.utc),
-                        node="llm_gemini",
-                        severity=EventSeverity.ERROR,
-                        kind=EventKind.ERROR,
-                        payload={
-                            "model": self._model_id,
-                            "error_type": type(mapped_error).__name__,
-                            "message": str(mapped_error),
-                        }
-                    ))
-                except Exception:
-                    pass  # Don't let event publishing fail the LLM call
-            raise mapped_error from exc
+            raise self._map_error(exc, model) from exc
 
-        latency_ms = (time.monotonic() - t0) * 1000
-        return self._parse_response(response, spec, latency_ms)
+        usage = LLMUsage()
+        meta = getattr(response, "usage_metadata", None)
+        if meta is not None:
+            usage.input_tokens = getattr(meta, "prompt_token_count", 0) or 0
+            usage.output_tokens = getattr(meta, "candidates_token_count", 0) or 0
+            usage.reasoning_tokens = getattr(meta, "thoughts_token_count", 0) or 0
 
-    async def stream(self, spec: TaskSpec) -> AsyncIterator[str]:
-        """Yield text deltas from a streaming response."""
-        config = self._build_config(spec, streaming=True)
-        contents = self._build_contents(spec)
-        try:
-            async def _run():
-                return self._client.models.generate_content_stream(
-                    model=self._model_id,
-                    contents=contents,
-                    config=config,
-                )
-            stream_iter = await asyncio.wait_for(
-                asyncio.to_thread(_run),
-                timeout=60.0,  # 60 second timeout for starting stream
-            )
-            for chunk in stream_iter:
-                text = getattr(chunk, "text", "") or ""
-                if text:
-                    yield text
-        except Exception as exc:
-            raise _map_error(exc, self._model_id) from exc
-        yield ""  # sentinel
-
-    def capabilities(self) -> dict[str, Any]:
-        return {
-            "native_json_schema": True,
-            "streaming": True,
-            "vision": True,
-            "max_context_tokens": 1_000_000,
-            "max_output_tokens": 8192,
-            "reasoning_control": self._tier == LLMTier.REASONING,
-            "may_train": True,   # free tier may train — drives PII scrubbing
-            "data_policy": "google_free_tier",
-            "provider": PROVIDER,
-            "model": self._model_id,
-            "tier": self._tier.value,
-        }
-
-    # ── Private helpers ───────────────────────────────────────────────────────
-
-    def _build_config(self, spec: TaskSpec, streaming: bool = False) -> Any:
-        kwargs: dict[str, Any] = {
-            "temperature": spec.temperature,
-            "max_output_tokens": spec.max_output_tokens,
-        }
-        # Structured output
-        if spec.output_schema:
-            kwargs["response_mime_type"] = "application/json"
-            kwargs["response_schema"] = spec.output_schema
-
-        # Reasoning / thinking budget
-        if self._tier == LLMTier.REASONING and spec.reasoning_effort != "none":
-            effort_map = {"low": 1024, "medium": 4096, "high": 8192}
-            budget = effort_map.get(spec.reasoning_effort, 4096)
-            kwargs["thinking_config"] = genai_types.ThinkingConfig(
-                thinking_budget=budget
-            )
-
-        return genai_types.GenerateContentConfig(**kwargs)
-
-    def _build_contents(self, spec: TaskSpec) -> list[Any]:
-        """Build the contents list from a TaskSpec.
-
-        Supports both text blocks and image parts for OCR/vision tasks.
-        """
-        parts: list[Any] = [spec.instruction]
-
-        for block in spec.data_blocks:
-            block_type = block.get("type", "text")
-
-            if block_type == "image":
-                # Add image part for vision/OCR
-                import base64
-                image_data = block.get("data", "")
-                mime_type = block.get("mime_type", "image/png")
-
-                # Decode base64 if needed
-                if isinstance(image_data, str):
-                    image_bytes = base64.b64decode(image_data)
-                else:
-                    image_bytes = image_data
-
-                parts.append(genai_types.Part.from_bytes(
-                    data=image_bytes,
-                    mime_type=mime_type
-                ))
-            else:
-                # Add text block
-                label = block.get("label", "DATA")
-                content = block.get("content", "")
-                parts.append(f"\n\n--- {label} ---\n{content}\n--- END {label} ---")
-
-        return ["\n".join(p) if isinstance(p, str) else p for p in parts]
-
-    def _parse_response(
-        self, response: Any, spec: TaskSpec, latency_ms: float
-    ) -> LLMResult:
-        try:
-            text = response.text or ""
-        except Exception:
-            text = ""
-
-        # Usage
-        usage_meta = getattr(response, "usage_metadata", None)
-        usage = LLMUsage(
-            input_tokens=getattr(usage_meta, "prompt_token_count", 0) or 0,
-            output_tokens=getattr(usage_meta, "candidates_token_count", 0) or 0,
-            reasoning_tokens=getattr(usage_meta, "thoughts_token_count", 0) or 0,
-            latency_ms=latency_ms,
-        )
-
-        # Parse JSON if schema was requested
-        parsed = None
-        if spec.output_schema and text:
+        text = getattr(response, "text", None) or ""
+        if not text:
+            # Fallback: read parts manually (some SDK versions leave .text empty
+            # when the first candidate is a thought part).
             try:
-                parsed = json.loads(text)
-            except json.JSONDecodeError as e:
-                raise SchemaViolationError(
-                    PROVIDER, f"JSON parse failed: {e}", raw_output=text
-                ) from e
+                for cand in getattr(response, "candidates", None) or []:
+                    for part in getattr(cand.content, "parts", None) or []:
+                        t = getattr(part, "text", None)
+                        if t:
+                            text += t
+            except Exception:
+                pass
+        if not text:
+            raise TransientError(self.name, f"{model}: empty response")
+
+        if self._rate_observer is not None:
+            try:
+                self._rate_observer(model, None)
+            except Exception:
+                logger.debug("rate observer failed", exc_info=True)
 
         return LLMResult(
             content=text,
-            parsed=parsed,
             usage=usage,
-            provider=PROVIDER,
-            model=self._model_id,
-            tier=self._tier,
+            provider=self.name,
+            model=model,
+            tier=spec.tier,
         )
 
+    # ── Helpers ──────────────────────────────────────────────────────────────
 
-class GeminiLLMAdapter:
-    """Multi-tier Gemini adapter implementing LLMPort.
+    def _build_contents(self, spec: TaskSpec) -> Any:
+        parts: list[Any] = []
+        if spec.prompt:
+            parts.append(spec.prompt)
+        for img in spec.images:
+            parts.append(types.Part.from_bytes(data=img, mime_type="image/png"))
+        if not parts:
+            parts.append("Begin.")
+        return parts
 
-    Routes TaskSpec to the appropriate model based on tier (fast, reasoning, vision)
-    as configured in settings.
-    """
-
-    def __init__(self, api_key: str, settings: Any = None, bus=None) -> None:
-        self._api_key = api_key
-        self._settings = settings
-        self._bus = bus  # Optional EventBus for error reporting
-        self._adapters: dict[str, GeminiAdapter] = {}
-
-    def _get_adapter(self, tier: LLMTier, model: str | None = None) -> GeminiAdapter:
-        if not model and self._settings:
-            if tier == LLMTier.REASONING:
-                models = self._settings.reasoning_models()
-            elif tier == LLMTier.VISION:
-                models = self._settings.vision_models()
-            else:
-                models = self._settings.fast_models()
-            model = models[0] if models else "gemini-3.6-flash"
-        model = model or "gemini-3.6-flash"
-        cache_key = f"{model}:{tier.value}"
-        if cache_key not in self._adapters:
-            self._adapters[cache_key] = GeminiAdapter(
-                api_key=self._api_key, model_id=model, tier=tier, bus=self._bus
-            )
-        return self._adapters[cache_key]
-
-    async def complete(self, spec: TaskSpec) -> LLMResult:
-        """Try models in chain with fallback on transient/quota errors."""
-        if not self._settings:
-            # No settings - use default behavior
-            adapter = self._get_adapter(spec.tier)
-            return await adapter.complete(spec)
-
-        # Get model chain for this tier - filter to only Gemini models
-        if spec.tier == LLMTier.REASONING:
-            models = [m for m in self._settings.reasoning_models() if m.startswith("gemini")]
-        elif spec.tier == LLMTier.VISION:
-            models = [m for m in self._settings.vision_models() if m.startswith("gemini")]
-        else:
-            models = [m for m in self._settings.fast_models() if m.startswith("gemini")]
-
-        models = models or ["gemini-3.6-flash"]
-
-        # Try each model in the chain
-        last_error = None
-        for model in models:
-            try:
-                adapter = self._get_adapter(spec.tier, model)
-                return await adapter.complete(spec)
-            except Exception as exc:
-                from scholarship_finder.errors import (
-                    QuotaExhaustedError, AdapterError, TransientError as SFTransientError,
-                    ModelUnavailableError, RateLimitedError,
-                )
-                last_error = exc
-                if isinstance(exc, (QuotaExhaustedError, ModelUnavailableError)):
-                    # These errors mean this model is permanently unavailable - skip to next
-                    logger.warning("Model %s unavailable/exhausted, trying next in chain: %s", model, exc)
-                    continue
-                elif isinstance(exc, (SFTransientError, RateLimitedError)):
-                    # Transient errors: try once more after brief wait, then fall through to next model
-                    logger.warning("Model %s transient error, retrying once: %s", model, exc)
-                    try:
-                        await asyncio.sleep(2.0)  # Brief backoff for 503s
-                        adapter2 = self._get_adapter(spec.tier, model)
-                        return await adapter2.complete(spec)
-                    except Exception as exc2:
-                        logger.warning("Model %s retry also failed, trying next in chain: %s", model, exc2)
-                        last_error = exc2
-                        continue
-                elif isinstance(exc, AdapterError):
-                    # Other adapter errors - fall through to next model
-                    logger.warning("Model %s failed, trying next in chain: %s", model, exc)
-                    continue
-                # For non-adapter errors, propagate
-                raise
-
-        # All models failed
-        if last_error:
-            raise last_error
-        raise RuntimeError("No models available in chain")
-
-    async def stream(self, spec: TaskSpec) -> AsyncIterator[str]:
-        """Try models in chain with fallback on transient/quota errors."""
-        if not self._settings:
-            # No settings - use default behavior
-            adapter = self._get_adapter(spec.tier)
-            async for chunk in adapter.stream(spec):
-                yield chunk
-            return
-
-        # Get model chain for this tier - filter to only Gemini models
-        if spec.tier == LLMTier.REASONING:
-            models = [m for m in self._settings.reasoning_models() if m.startswith("gemini")]
-        elif spec.tier == LLMTier.VISION:
-            models = [m for m in self._settings.vision_models() if m.startswith("gemini")]
-        else:
-            models = [m for m in self._settings.fast_models() if m.startswith("gemini")]
-
-        models = models or ["gemini-3.6-flash"]
-
-        # Try each model in the chain
-        last_error = None
-        for model in models:
-            try:
-                adapter = self._get_adapter(spec.tier, model)
-                async for chunk in adapter.stream(spec):
-                    yield chunk
-                return  # Success - exit iterator
-            except Exception as exc:
-                from scholarship_finder.errors import (
-                    QuotaExhaustedError, AdapterError, TransientError as SFTransientError,
-                    ModelUnavailableError, RateLimitedError,
-                )
-                last_error = exc
-                if isinstance(exc, (QuotaExhaustedError, ModelUnavailableError, SFTransientError,
-                                    RateLimitedError, AdapterError)):
-                    logger.warning("Model %s failed during stream, trying next in chain: %s", model, exc)
-                    continue
-                # For non-adapter errors, propagate
-                raise
-
-        # All models failed
-        if last_error:
-            raise last_error
-        raise RuntimeError("No models available in chain")
-
-    def capabilities(self) -> dict[str, Any]:
-        return {
-            "native_json_schema": True,
-            "streaming": True,
-            "vision": True,
-            "max_context_tokens": 1_000_000,
-            "max_output_tokens": 8192,
-            "reasoning_control": True,
-            "may_train": False,
-            "data_policy": "gemini_free_or_paid",
-            "provider": PROVIDER,
+    def _build_config(self, spec: TaskSpec) -> types.GenerateContentConfig:
+        kwargs: dict[str, Any] = {
+            "max_output_tokens": spec.max_output_tokens,
+            "temperature": spec.temperature,
         }
+        if spec.system:
+            kwargs["system_instruction"] = spec.system
+        if spec.json_mode:
+            kwargs["response_mime_type"] = "application/json"
+        # Gemini 3.x rejects thinking_budget=0 (400) and some models reject "minimal";
+        # "low" is accepted everywhere and keeps thought from eating the output budget.
+        kwargs["thinking_config"] = types.ThinkingConfig(thinking_level="low")
+        kwargs["max_output_tokens"] = spec.max_output_tokens + _THINKING_HEADROOM
+        return types.GenerateContentConfig(**kwargs)
 
+    def _map_error(self, exc: Exception, model: str) -> AdapterError:
+        provider = self.name
+        code = getattr(exc, "code", None)
+        status = str(getattr(exc, "status", "") or "").upper()
+        msg = str(exc)
+
+        if code == 429 or "RESOURCE_EXHAUSTED" in status:
+            # Gemini daily-quota exhaustion usually reports as RESOURCE_EXHAUSTED
+            # with "quota" in the message; per-minute bursts are plain 429s.
+            if "quota" in msg.lower() and "per_day" in msg.lower():
+                return QuotaExhaustedError(provider, f"{model}: daily quota: {msg}")
+            return RateLimitedError(
+                provider, f"{model}: rate limited: {msg}",
+                scope=RateLimitScope.MINUTE, retry_after=_retry_after(exc),
+            )
+        if code in (401, 403) or status in ("UNAUTHENTICATED", "PERMISSION_DENIED"):
+            return AuthError(provider, f"{model}: auth/permission: {msg}")
+        if code == 404 or status == "NOT_FOUND":
+            return ModelUnavailableError(provider, f"{model}: not found: {msg}")
+        if code == 400 or status == "INVALID_ARGUMENT":
+            return ModelUnavailableError(provider, f"{model}: {msg}")
+            low = msg.lower()
+            if "context" in low or "token" in low and "exceed" in low or "too long" in low:
+                return ContextTooLongError(provider, f"{model}: {msg}")
+            return TransientError(provider, f"{model}: invalid request: {msg}")
+        if code in (408, 504) or status in ("DEADLINE_EXCEEDED",):
+            return TransientError(provider, f"{model}: deadline exceeded: {msg}")
+        if code is not None and code >= 500 or status in ("UNAVAILABLE", "INTERNAL"):
+            return TransientError(provider, f"{model}: server error {code}: {msg}")
+        return UnknownAdapterError(provider, f"{model}: {msg}", exc)
+
+
+def _retry_after(exc: Exception) -> float:
+    """Best-effort retry-after seconds from a Gemini error's details."""
+    details = getattr(exc, "details", None) or {}
+    try:
+        for item in details.get("error", {}).get("details", []):
+            if item.get("@type", "").endswith("RetryInfo"):
+                delay = item.get("retryDelay", "")
+                return float(str(delay).rstrip("s"))
+    except Exception:
+        pass
+    return 0.0

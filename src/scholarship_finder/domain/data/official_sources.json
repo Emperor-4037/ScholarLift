@@ -1,0 +1,92 @@
+{
+  "germany": [
+    "daad.de",
+    "deutschland-stipendium.de",
+    "stipendiumplus.de"
+  ],
+  "canada": [
+    "educanada.ca",
+    "scholarships-bourses.gc.ca",
+    "gc.ca"
+  ],
+  "uk": [
+    "chevening.org",
+    "cscuk.fcdo.gov.uk",
+    "britishcouncil.org",
+    "ac.uk"
+  ],
+  "united kingdom": [
+    "chevening.org",
+    "cscuk.fcdo.gov.uk",
+    "britishcouncil.org",
+    "ac.uk"
+  ],
+  "australia": [
+    "studyaustralia.gov.au",
+    "dfat.gov.au",
+    "edu.au"
+  ],
+  "singapore": [
+    "moe.gov.sg",
+    "a-star.edu.sg",
+    "edu.sg"
+  ],
+  "usa": [
+    "fulbright.org",
+    "state.gov",
+    "edu"
+  ],
+  "united states": [
+    "fulbright.org",
+    "state.gov",
+    "edu"
+  ],
+  "netherlands": [
+    "studyinnl.org",
+    "nuffic.nl",
+    "orangeknowledge.nl"
+  ],
+  "france": [
+    "campusfrance.org",
+    "eiffel.enseignementsup-recherche.gouv.fr"
+  ],
+  "ireland": [
+    "hea.ie",
+    "dttas.gov.ie"
+  ],
+  "new zealand": [
+    "education.govt.nz",
+    "nzscholarships.govt.nz"
+  ],
+  "japan": [
+    "mext.go.jp",
+    "jasso.go.jp"
+  ],
+  "south korea": [
+    "niied.go.kr",
+    "studyinkorea.go.kr"
+  ],
+  "sweden": [
+    "si.se",
+    "universityadmissions.se"
+  ],
+  "_multi": [
+    "eacea.ec.europa.eu",
+    "erasmus-plus.ec.europa.eu"
+  ],
+  "_india_out": [
+    "usief.org.in",
+    "jntataendowment.org",
+    "inlaksfoundation.org",
+    "kcmet.org",
+    "nosmsje.gov.in",
+    "britishcouncil.in",
+    "daad.in",
+    "akdn.org"
+  ],
+  "_nigeria_out": [
+    "ptdf.gov.ng",
+    "tetfund.gov.ng",
+    "mastercardfdn.org"
+  ]
+}

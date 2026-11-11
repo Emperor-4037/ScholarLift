@@ -1,0 +1,1290 @@
+{
+  "run_id": "1cb0fbb1-7cf2-4f4c-931e-92c91a73e64a",
+  "phase": "COMPLETED",
+  "outcome": "COMPLETE",
+  "status": "finished",
+  "elapsed_s": 178.8,
+  "degradation_flags": [],
+  "counters": {
+    "candidates": 71,
+    "leads": 30,
+    "opportunities": 12,
+    "verified": 12,
+    "assessed": 12,
+    "top_5": 5,
+    "search_rounds": 1,
+    "expansion_rounds": 1
+  },
+  "profile": {
+    "nationality": "Indian",
+    "current_country": "India",
+    "languages": [
+      "English",
+      "Hindi"
+    ],
+    "education": {
+      "degree": "B.Tech",
+      "field": "Computer Science and Engineering",
+      "institution": "VIT Vellore",
+      "level": "bachelors",
+      "cgpa": "8.2/10.0",
+      "us_gpa": 3.7
+    },
+    "skills": [
+      "Python",
+      "JavaScript",
+      "React",
+      "Node.js",
+      "Machine Learning",
+      "MongoDB",
+      "SQL",
+      "MERN stack",
+      "scikit-learn",
+      "service workers",
+      "IndexedDB",
+      "C++"
+    ],
+    "projects": [
+      {
+        "title": "CampusConnect",
+        "summary": "MERN-stack campus event platform used by ~2,000 students",
+        "technologies": [
+          "React",
+          "Node.js",
+          "MongoDB"
+        ],
+        "source": "document"
+      },
+      {
+        "title": "CropCast",
+        "summary": "ML crop-yield prediction pipeline, 87% accuracy on district data",
+        "technologies": [
+          "Python",
+          "scikit-learn"
+        ],
+        "source": "document"
+      },
+      {
+        "title": "LedgerLite",
+        "summary": "Offline-first budgeting PWA with service workers",
+        "technologies": [
+          "JavaScript",
+          "IndexedDB"
+        ],
+        "source": "document"
+      },
+      {
+        "title": "async-parser",
+        "summary": "A program to parse characters from a file asynchronously such that the parsed characters could be processed and partitioned in parallel.",
+        "technologies": [
+          "C++"
+        ],
+        "source": "github"
+      },
+      {
+        "title": "hello-world",
+        "summary": "getting hands on github",
+        "technologies": [],
+        "source": "github"
+      }
+    ],
+    "research": [
+      {
+        "title": "Lightweight Transformers for Regional-Language OCR",
+        "kind": "publication",
+        "venue": "IEEE INDICON 2025"
+      }
+    ],
+    "experience": [
+      {
+        "role": "Software Engineering Intern",
+        "organization": "Fintech startup",
+        "months": 6
+      }
+    ],
+    "activities": [
+      {
+        "title": "Developer Student Club",
+        "role": "Technical Lead"
+      }
+    ],
+    "awards": [
+      {
+        "name": "Smart India Hackathon 2024 — Winner",
+        "year": 2024
+      }
+    ],
+    "language_tests": [
+      {
+        "test": "IELTS",
+        "score": 7.0
+      }
+    ],
+    "preferences": {
+      "degree_level": "masters",
+      "target_fields": [
+        "Computer Science",
+        "Data Science",
+        "Artificial Intelligence"
+      ],
+      "countries": [
+        "Canada",
+        "Germany",
+        "Singapore"
+      ],
+      "instruction_languages": [
+        "English"
+      ],
+      "intake": "Fall 2026",
+      "funding_required": true
+    },
+    "financial_need": {
+      "level": "full",
+      "annual_budget_usd": null
+    },
+    "completeness_flags": {
+      "has_education": true,
+      "has_gpa": true,
+      "has_skills": true,
+      "has_language_test": true,
+      "has_countries": true,
+      "has_nationality": true,
+      "has_github": true
+    },
+    "field_sources": {
+      "research": "form",
+      "field_sources": "form",
+      "skills": "form",
+      "financial_need": "form",
+      "completeness_flags": "form",
+      "experience": "form",
+      "language_tests": "form",
+      "languages": "form",
+      "awards": "form",
+      "current_country": "form",
+      "education": "form",
+      "preferences": "form",
+      "nationality": "form",
+      "github_signals": "form",
+      "projects": "form",
+      "activities": "form",
+      "current_level": "form"
+    }
+  },
+  "top_5": [
+    {
+      "id": "c5c994f2-4b1b-4941-9e5d-da69fcd6931e",
+      "rank": 1,
+      "name": "Graduate Student Research Grants",
+      "provider": "Geological Society of America (GSA)",
+      "country": "United States, Canada, Mexico",
+      "kind": "SCHOLARSHIP",
+      "degree_levels": [
+        "master",
+        "doctoral"
+      ],
+      "fields_of_study": [
+        "Geological Sciences",
+        "Earth Science"
+      ],
+      "official_url": "https://geosociety.org/grants-scholarships/graduate-research",
+      "application_url": "",
+      "how_to_apply": "Apply online and ensure one appraisal from the primary advisor is submitted with each application.",
+      "trust_tier": "UNKNOWN",
+      "funding": {
+        "level": "UNKNOWN",
+        "details": "partial_tuition",
+        "amount": "average grant of ~$2,688 (Specialized awards like the Jack Kleinman Memorial Award may be up to $5,000)",
+        "covers": []
+      },
+      "deadline": {
+        "text": "18 February, 11:59 p.m. MST",
+        "iso": null,
+        "days_left": null,
+        "is_past": null
+      },
+      "selection_criteria": [],
+      "evidence": [
+        {
+          "field": "deadline",
+          "quote": "2026 application deadline: 18 February, 11:59 p.m. MST.",
+          "url": "https://geosociety.org/grants-scholarships/graduate-research"
+        },
+        {
+          "field": "funding",
+          "quote": "In 2025, approximately $900,000 was awarded to 354 graduate students (~52.2% of the 678 who applied), with an average grant of ~$2,688.",
+          "url": "https://geosociety.org/grants-scholarships/graduate-research"
+        },
+        {
+          "field": "eligibility",
+          "quote": "Applicants must be currently enrolled in a North American or Central American university or college in an earth science graduate degree program (with a geologic component).",
+          "url": "https://geosociety.org/grants-scholarships/graduate-research"
+        }
+      ],
+      "assessment": {
+        "status": "likely_eligible",
+        "composite_score": 52.25,
+        "confidence": 0.75,
+        "rank": 1,
+        "days_to_deadline": null,
+        "rationale": "Geological sciences do not match CS/AI background; eligibility not nationality‑restricted.",
+        "strengths": [
+          "master level"
+        ],
+        "concerns": [
+          "field mismatch"
+        ],
+        "components": [
+          {
+            "component": "eligibility",
+            "score": 75.0,
+            "weight": 0.25,
+            "weighted": 18.75,
+            "explanation": "status=likely_eligible (4 met / 0 unmet rules) → 75"
+          },
+          {
+            "component": "field_alignment",
+            "score": 0.0,
+            "weight": 0.2,
+            "weighted": 0.0,
+            "explanation": "field alignment 0.00 → 0"
+          },
+          {
+            "component": "funding_fit",
+            "score": 40.0,
+            "weight": 0.2,
+            "weighted": 8.0,
+            "explanation": "funding level UNKNOWN → 40"
+          },
+          {
+            "component": "academic_fit",
+            "score": 50.0,
+            "weight": 0.1,
+            "weighted": 5.0,
+            "explanation": "GPA not compared (missing data) → 50"
+          },
+          {
+            "component": "profile_strength",
+            "score": 100.0,
+            "weight": 0.1,
+            "weighted": 10.0,
+            "explanation": "profile strength 1.00 → 100"
+          },
+          {
+            "component": "evidence_confidence",
+            "score": 75.0,
+            "weight": 0.1,
+            "weighted": 7.5,
+            "explanation": "3 evidenced fields, completeness 0.75 → 75"
+          },
+          {
+            "component": "deadline",
+            "score": 60.0,
+            "weight": 0.05,
+            "weighted": 3.0,
+            "explanation": "no deadline stated → neutral 60"
+          }
+        ],
+        "rules": [
+          {
+            "rule": "nationality",
+            "label": "Nationality",
+            "result": "MET",
+            "candidate": "Indian",
+            "required": "Applicants do not need to be a U.S. Citizen or a U.S. Resident Alien.",
+            "explanation": "Region text 'Applicants do not need to be a U.S. Citizen or a U.S. Resident Alien.' vs Indian"
+          },
+          {
+            "rule": "degree_level",
+            "label": "Degree level",
+            "result": "MET",
+            "candidate": "masters",
+            "required": "master, doctoral",
+            "explanation": "Student target masters vs levels [master, doctoral]"
+          },
+          {
+            "rule": "field_of_study",
+            "label": "Field of study",
+            "result": "MET",
+            "candidate": "Computer Science, Data Science, Artificial Intelligence",
+            "required": "Geological Sciences, Earth Science",
+            "explanation": "field token overlap: ['science'] (student: Computer Science, Data Science, Artificial Intelligence)"
+          },
+          {
+            "rule": "destination",
+            "label": "Destination",
+            "result": "MET",
+            "candidate": "canada, germany, singapore",
+            "required": "canada, mexico, united states, united states, canada, mexico",
+            "explanation": "host canada, mexico, united states, united states, canada, mexico in target countries"
+          },
+          {
+            "rule": "funding_fit",
+            "label": "Funding vs need",
+            "result": "UNKNOWN",
+            "candidate": "needs full funding",
+            "required": "UNKNOWN",
+            "explanation": "Student needs full funding; offer is UNKNOWN (informational)"
+          }
+        ]
+      },
+      "application": {
+        "status": "ready"
+      }
+    },
+    {
+      "id": "a7395dd9-0df3-46db-ae46-e464cfa039e3",
+      "rank": 2,
+      "name": "2026 Research Grants",
+      "provider": "Merck KGaA, Darmstadt, Germany",
+      "country": "",
+      "kind": "SCHOLARSHIP",
+      "degree_levels": [],
+      "fields_of_study": [
+        "In-vitro models and assays to identify novel therapies for neuroinflammatory diseases",
+        "Artificial intelligence in cell culture media and process development",
+        "Innovative approaches to economical remediation"
+      ],
+      "official_url": "https://www.emdgroup.com/en/research/open-innovation/research-grants.html",
+      "application_url": "https://www.emdgroup.com/en/research/open-innovation/research-grants.html",
+      "how_to_apply": "",
+      "trust_tier": "UNKNOWN",
+      "funding": {
+        "level": "UNKNOWN",
+        "details": "partial",
+        "amount": "up to 500,000€ per year for up to 3 years",
+        "covers": []
+      },
+      "deadline": {
+        "text": "31 August 2026",
+        "iso": "2026-08-31",
+        "days_left": -72,
+        "is_past": true
+      },
+      "selection_criteria": [],
+      "evidence": [
+        {
+          "field": "name",
+          "quote": "In 2026, grants are available in the areas further specified below.",
+          "url": "https://merckgroup.com/en/research/open-innovation/research-grants.html"
+        },
+        {
+          "field": "deadline",
+          "quote": "deadline for the 2026 Research Grants is 31 August 2026",
+          "url": "https://merckgroup.com/en/research/open-innovation/research-grants.html"
+        },
+        {
+          "field": "funding",
+          "quote": "Grants of up to 500,000€ per year for up to 3 years have been made available.",
+          "url": "https://merckgroup.com/en/research/open-innovation/research-grants.html"
+        },
+        {
+          "field": "eligibility",
+          "quote": "* ### When is the application deadline? Submissions will be accepted until 31 August 2026, 23",
+          "url": "https://merckgroup.com/en/research/open-innovation/research-grants.html"
+        }
+      ],
+      "assessment": {
+        "status": "near_miss",
+        "composite_score": 60.25,
+        "confidence": 1.0,
+        "rank": 2,
+        "days_to_deadline": -72,
+        "rationale": "AI focus aligns with student's AI expertise; German grant with no nationality restriction.",
+        "strengths": [
+          "AI relevance",
+          "master level"
+        ],
+        "concerns": [],
+        "components": [
+          {
+            "component": "eligibility",
+            "score": 45.0,
+            "weight": 0.25,
+            "weighted": 11.25,
+            "explanation": "status=near_miss (1 met / 1 unmet rules) → 45"
+          },
+          {
+            "component": "field_alignment",
+            "score": 80.0,
+            "weight": 0.2,
+            "weighted": 16.0,
+            "explanation": "field alignment 0.80 → 80"
+          },
+          {
+            "component": "funding_fit",
+            "score": 40.0,
+            "weight": 0.2,
+            "weighted": 8.0,
+            "explanation": "funding level UNKNOWN → 40"
+          },
+          {
+            "component": "academic_fit",
+            "score": 50.0,
+            "weight": 0.1,
+            "weighted": 5.0,
+            "explanation": "GPA not compared (missing data) → 50"
+          },
+          {
+            "component": "profile_strength",
+            "score": 100.0,
+            "weight": 0.1,
+            "weighted": 10.0,
+            "explanation": "profile strength 1.00 → 100"
+          },
+          {
+            "component": "evidence_confidence",
+            "score": 100.0,
+            "weight": 0.1,
+            "weighted": 10.0,
+            "explanation": "4 evidenced fields, completeness 1.00 → 100"
+          },
+          {
+            "component": "deadline",
+            "score": 0.0,
+            "weight": 0.05,
+            "weighted": 0.0,
+            "explanation": "deadline passed 72 days ago → 0"
+          }
+        ],
+        "rules": [
+          {
+            "rule": "destination",
+            "label": "Destination",
+            "result": "UNKNOWN",
+            "candidate": "canada, germany, singapore",
+            "required": "host country unstated",
+            "explanation": "host country not stated on page"
+          },
+          {
+            "rule": "language_pte",
+            "label": "Language: PTE",
+            "result": "MET",
+            "candidate": "IELTS 7.0 ≈ PTE 65 (estimate)",
+            "required": "PTE ≥ 31.0",
+            "explanation": "IELTS 7.0 ≈ PTE 65 (estimate) vs required PTE ≥ 31.0 (estimate)"
+          },
+          {
+            "rule": "deadline",
+            "label": "Deadline",
+            "result": "UNMET",
+            "candidate": "",
+            "required": "2026-08-31",
+            "explanation": "Deadline 2026-08-31 passed 72 days ago — watch for the next cycle"
+          },
+          {
+            "rule": "funding_fit",
+            "label": "Funding vs need",
+            "result": "UNKNOWN",
+            "candidate": "needs full funding",
+            "required": "UNKNOWN",
+            "explanation": "Student needs full funding; offer is UNKNOWN (informational)"
+          }
+        ]
+      },
+      "application": null
+    },
+    {
+      "id": "825a1599-6e90-4b8a-a159-9d143854a66a",
+      "rank": 3,
+      "name": "Canada Graduate Research Scholarship – Master's program (CGRS M)",
+      "provider": "Natural Sciences and Engineering Research Council of Canada (NSERC), Canadian Institutes of Health Research (CIHR), Social Sciences and Humanities Research Council (SSHRC)",
+      "country": "Canada",
+      "kind": "SCHOLARSHIP",
+      "degree_levels": [
+        "Master's"
+      ],
+      "fields_of_study": [
+        "All disciplines"
+      ],
+      "official_url": "https://nserc-crsng.canada.ca/en/funding-opportunity/canada-graduate-research-scholarship-masters-program",
+      "application_url": "",
+      "how_to_apply": "",
+      "trust_tier": "UNKNOWN",
+      "funding": {
+        "level": "UNKNOWN",
+        "details": "scholarship",
+        "amount": "$27,000",
+        "covers": []
+      },
+      "deadline": {
+        "text": "December 1 before 8:00 pm (ET)",
+        "iso": null,
+        "days_left": null,
+        "is_past": null
+      },
+      "selection_criteria": [],
+      "evidence": [],
+      "assessment": {
+        "status": "requirements_unverified",
+        "composite_score": 58.5,
+        "confidence": 0.0,
+        "rank": 3,
+        "days_to_deadline": null,
+        "rationale": "Open to all disciplines for Master's in Canada; student meets level and field.",
+        "strengths": [
+          "open to all fields",
+          "master level"
+        ],
+        "concerns": [],
+        "components": [
+          {
+            "component": "eligibility",
+            "score": 50.0,
+            "weight": 0.25,
+            "weighted": 12.5,
+            "explanation": "status=requirements_unverified (1 met / 0 unmet rules) → 50"
+          },
+          {
+            "component": "field_alignment",
+            "score": 100.0,
+            "weight": 0.2,
+            "weighted": 20.0,
+            "explanation": "field alignment 1.00 → 100"
+          },
+          {
+            "component": "funding_fit",
+            "score": 40.0,
+            "weight": 0.2,
+            "weighted": 8.0,
+            "explanation": "funding level UNKNOWN → 40"
+          },
+          {
+            "component": "academic_fit",
+            "score": 50.0,
+            "weight": 0.1,
+            "weighted": 5.0,
+            "explanation": "GPA not compared (missing data) → 50"
+          },
+          {
+            "component": "profile_strength",
+            "score": 100.0,
+            "weight": 0.1,
+            "weighted": 10.0,
+            "explanation": "profile strength 1.00 → 100"
+          },
+          {
+            "component": "evidence_confidence",
+            "score": 0.0,
+            "weight": 0.1,
+            "weighted": 0.0,
+            "explanation": "0 evidenced fields, completeness 0.00 → 0"
+          },
+          {
+            "component": "deadline",
+            "score": 60.0,
+            "weight": 0.05,
+            "weighted": 3.0,
+            "explanation": "no deadline stated → neutral 60"
+          }
+        ],
+        "rules": [
+          {
+            "rule": "destination",
+            "label": "Destination",
+            "result": "MET",
+            "candidate": "canada, germany, singapore",
+            "required": "canada",
+            "explanation": "host canada in target countries"
+          },
+          {
+            "rule": "funding_fit",
+            "label": "Funding vs need",
+            "result": "UNKNOWN",
+            "candidate": "needs full funding",
+            "required": "UNKNOWN",
+            "explanation": "Student needs full funding; offer is UNKNOWN (informational)"
+          }
+        ]
+      },
+      "application": null
+    },
+    {
+      "id": "973a9de7-39a4-455a-a821-57ef2fecb839",
+      "rank": 4,
+      "name": "DAAD Hilde Domin Scholarship",
+      "provider": "DAAD / DSFG",
+      "country": "Germany",
+      "kind": "SCHOLARSHIP",
+      "degree_levels": [],
+      "fields_of_study": [],
+      "official_url": "https://ds-fg.com/service/daad-hilde-domin-scholarship-v2/",
+      "application_url": "https://ds-fg.com/service/daad-hilde-domin-scholarship-v2/",
+      "how_to_apply": "",
+      "trust_tier": "UNKNOWN",
+      "funding": {
+        "level": "UNKNOWN",
+        "details": "",
+        "amount": null,
+        "covers": []
+      },
+      "deadline": null,
+      "selection_criteria": [],
+      "evidence": [
+        {
+          "field": "name",
+          "quote": "DAAD Hilde Domin Scholarship",
+          "url": "https://ds-fg.com/service/daad-hilde-domin-scholarship-v2"
+        }
+      ],
+      "assessment": {
+        "status": "requirements_unverified",
+        "composite_score": 41.0,
+        "confidence": 0.25,
+        "rank": 4,
+        "days_to_deadline": null,
+        "rationale": "No specific field or eligibility information provided; cannot assess alignment.",
+        "strengths": [
+          "master level"
+        ],
+        "concerns": [
+          "insufficient data"
+        ],
+        "components": [
+          {
+            "component": "eligibility",
+            "score": 50.0,
+            "weight": 0.25,
+            "weighted": 12.5,
+            "explanation": "status=requirements_unverified (1 met / 0 unmet rules) → 50"
+          },
+          {
+            "component": "field_alignment",
+            "score": 0.0,
+            "weight": 0.2,
+            "weighted": 0.0,
+            "explanation": "field alignment 0.00 → 0"
+          },
+          {
+            "component": "funding_fit",
+            "score": 40.0,
+            "weight": 0.2,
+            "weighted": 8.0,
+            "explanation": "funding level UNKNOWN → 40"
+          },
+          {
+            "component": "academic_fit",
+            "score": 50.0,
+            "weight": 0.1,
+            "weighted": 5.0,
+            "explanation": "GPA not compared (missing data) → 50"
+          },
+          {
+            "component": "profile_strength",
+            "score": 100.0,
+            "weight": 0.1,
+            "weighted": 10.0,
+            "explanation": "profile strength 1.00 → 100"
+          },
+          {
+            "component": "evidence_confidence",
+            "score": 25.0,
+            "weight": 0.1,
+            "weighted": 2.5,
+            "explanation": "1 evidenced fields, completeness 0.25 → 25"
+          },
+          {
+            "component": "deadline",
+            "score": 60.0,
+            "weight": 0.05,
+            "weighted": 3.0,
+            "explanation": "no deadline stated → neutral 60"
+          }
+        ],
+        "rules": [
+          {
+            "rule": "destination",
+            "label": "Destination",
+            "result": "MET",
+            "candidate": "canada, germany, singapore",
+            "required": "germany",
+            "explanation": "host germany in target countries"
+          },
+          {
+            "rule": "funding_fit",
+            "label": "Funding vs need",
+            "result": "UNKNOWN",
+            "candidate": "needs full funding",
+            "required": "UNKNOWN",
+            "explanation": "Student needs full funding; offer is UNKNOWN (informational)"
+          }
+        ]
+      },
+      "application": null
+    },
+    {
+      "id": "9e61e273-e93e-45df-a785-99f45fa43f89",
+      "rank": 5,
+      "name": "In-Region Scholarship Programme Central America",
+      "provider": "DAAD - Deutscher Akademischer Austauschdienst",
+      "country": "Germany",
+      "kind": "SCHOLARSHIP",
+      "degree_levels": [],
+      "fields_of_study": [],
+      "official_url": "https://www2.daad.de/deutschland/stipendium/datenbank/en/21148-scholarship-database?detail=57176484&page=1&q=central+america",
+      "application_url": "",
+      "how_to_apply": "",
+      "trust_tier": "RECOGNIZED_FUNDER",
+      "funding": {
+        "level": "UNKNOWN",
+        "details": "",
+        "amount": null,
+        "covers": []
+      },
+      "deadline": null,
+      "selection_criteria": [],
+      "evidence": [],
+      "assessment": {
+        "status": "requirements_unverified",
+        "composite_score": 38.5,
+        "confidence": 0.0,
+        "rank": 5,
+        "days_to_deadline": null,
+        "rationale": "Eligibility appears limited to Central America; Indian applicant not eligible, fields unspecified.",
+        "strengths": [
+          "master level"
+        ],
+        "concerns": [
+          "nationality ineligible"
+        ],
+        "components": [
+          {
+            "component": "eligibility",
+            "score": 50.0,
+            "weight": 0.25,
+            "weighted": 12.5,
+            "explanation": "status=requirements_unverified (1 met / 0 unmet rules) → 50"
+          },
+          {
+            "component": "field_alignment",
+            "score": 0.0,
+            "weight": 0.2,
+            "weighted": 0.0,
+            "explanation": "field alignment 0.00 → 0"
+          },
+          {
+            "component": "funding_fit",
+            "score": 40.0,
+            "weight": 0.2,
+            "weighted": 8.0,
+            "explanation": "funding level UNKNOWN → 40"
+          },
+          {
+            "component": "academic_fit",
+            "score": 50.0,
+            "weight": 0.1,
+            "weighted": 5.0,
+            "explanation": "GPA not compared (missing data) → 50"
+          },
+          {
+            "component": "profile_strength",
+            "score": 100.0,
+            "weight": 0.1,
+            "weighted": 10.0,
+            "explanation": "profile strength 1.00 → 100"
+          },
+          {
+            "component": "evidence_confidence",
+            "score": 0.0,
+            "weight": 0.1,
+            "weighted": 0.0,
+            "explanation": "0 evidenced fields, completeness 0.00 → 0"
+          },
+          {
+            "component": "deadline",
+            "score": 60.0,
+            "weight": 0.05,
+            "weighted": 3.0,
+            "explanation": "no deadline stated → neutral 60"
+          }
+        ],
+        "rules": [
+          {
+            "rule": "destination",
+            "label": "Destination",
+            "result": "MET",
+            "candidate": "canada, germany, singapore",
+            "required": "germany",
+            "explanation": "host germany in target countries"
+          },
+          {
+            "rule": "funding_fit",
+            "label": "Funding vs need",
+            "result": "UNKNOWN",
+            "candidate": "needs full funding",
+            "required": "UNKNOWN",
+            "explanation": "Student needs full funding; offer is UNKNOWN (informational)"
+          }
+        ]
+      },
+      "application": null
+    }
+  ],
+  "other_opportunities": [
+    {
+      "id": "5605e99c-9c02-4b1b-8825-0f2a086d272f",
+      "name": "Canadian Francophonie Scholarship Program",
+      "provider": "Government of Canada",
+      "country": "Canada",
+      "verified": true,
+      "status": "ineligible",
+      "score": 48.0,
+      "blocking_reasons": [],
+      "near_miss_gaps": [],
+      "not_ranked_reason": "ineligible",
+      "url": "https://international.gc.ca/world-monde/study_work_travel-etude_travail_voyage/cfsp-pcbf.aspx?lang=eng",
+      "trust_tier": "OFFICIAL_INSTITUTION",
+      "deadline": {
+        "text": "Application deadline: 31 March 2025",
+        "iso": "2025-03-31",
+        "days_left": -590,
+        "is_past": true
+      }
+    },
+    {
+      "id": "16cec0b3-4b2a-4c4c-9f4b-04eb8ce0b934",
+      "name": "Erasmus Mundus Joint Masters Scholarships",
+      "provider": "Erasmus Mundus Joint Master Degrees Programme",
+      "country": "Various European countries",
+      "verified": true,
+      "status": "ineligible",
+      "score": 28.0,
+      "blocking_reasons": [],
+      "near_miss_gaps": [],
+      "not_ranked_reason": "ineligible",
+      "url": "https://erasmus-mundus.eu/",
+      "trust_tier": "OFFICIAL_INSTITUTION",
+      "deadline": {
+        "text": "Application deadline: 31 August 2026",
+        "iso": "2026-08-31",
+        "days_left": -72,
+        "is_past": true
+      }
+    },
+    {
+      "id": "df7f1ccc-abc5-4491-9366-a2c6add156b2",
+      "name": "Development-Related Postgraduate Courses (EPOS)",
+      "provider": "DAAD",
+      "country": "Germany",
+      "verified": true,
+      "status": "ineligible",
+      "score": 33.5,
+      "blocking_reasons": [],
+      "near_miss_gaps": [],
+      "not_ranked_reason": "ineligible",
+      "url": "https://www2.daad.de/deutschland/stipendium/datenbank/en/21148-scholarship-database?detail=50076777",
+      "trust_tier": "UNKNOWN",
+      "deadline": null
+    },
+    {
+      "id": "3f6f4b5b-fd1e-47fe-ad07-e35e1cb2d161",
+      "name": "Development-Related Postgraduate Courses (EPOS) in Germany - Master's and PhD (2027/2028)",
+      "provider": "DAAD",
+      "country": "Germany",
+      "verified": true,
+      "status": "ineligible",
+      "score": 36.0,
+      "blocking_reasons": [],
+      "near_miss_gaps": [],
+      "not_ranked_reason": "ineligible",
+      "url": "https://static.daad.de/media/daad_de/pdfs_nicht_barrierefrei/in-deutschland-studieren-forschen-lehren/epos-bewerbungsdeadlines_2023-24.pdf",
+      "trust_tier": "UNKNOWN",
+      "deadline": {
+        "text": "List of all Postgraduate courses with application deadlines 2027/28",
+        "iso": null,
+        "days_left": null,
+        "is_past": null
+      }
+    },
+    {
+      "id": "5780867e-0bf4-46b8-8dc0-35d19c62ebd0",
+      "name": "Study scholarships for STEM disciplines, 2027/28",
+      "provider": "Scholafrik",
+      "country": "Germany",
+      "verified": true,
+      "status": "ineligible",
+      "score": 53.5,
+      "blocking_reasons": [],
+      "near_miss_gaps": [],
+      "not_ranked_reason": "ineligible",
+      "url": "https://www.scholafrik.com/scholarships/study-scholarships-for-stem-disciplines-2027-28-7e4ab7fc-fce6-4576-84f8-f91558d02ad3",
+      "trust_tier": "UNKNOWN",
+      "deadline": {
+        "text": "Deadline not listed",
+        "iso": null,
+        "days_left": null,
+        "is_past": null
+      }
+    },
+    {
+      "id": "39e09c5d-9e13-47f9-b688-0ba59ce71b8a",
+      "name": "Hilde Domin-Programme",
+      "provider": "Technical University of Munich (TUM)",
+      "country": "Germany",
+      "verified": true,
+      "status": "ineligible",
+      "score": 28.0,
+      "blocking_reasons": [],
+      "near_miss_gaps": [],
+      "not_ranked_reason": "ineligible",
+      "url": "https://www.tum.de/en/studies/fees-and-financial-aid/scholarships/tum-scholarships/students-at-risk-hilde-domin-programme",
+      "trust_tier": "OFFICIAL_INSTITUTION",
+      "deadline": {
+        "text": "Application deadline: 31.10.2025",
+        "iso": "2025-10-31",
+        "days_left": -376,
+        "is_past": true
+      }
+    },
+    {
+      "id": "968fb8e0-547b-46a5-bcb2-7d0501eaa280",
+      "name": "In-Region Scholarship Programme - Master in Tropical diseases",
+      "provider": "German Academic Exchange Service (DAAD)",
+      "country": "Costa Rica",
+      "verified": true,
+      "status": "ineligible",
+      "score": 33.0,
+      "blocking_reasons": [],
+      "near_miss_gaps": [],
+      "not_ranked_reason": "ineligible",
+      "url": "https://daad-costa-rica.org/files/2023/03/Call-for-Scholarship-Applications-Enfermedades.pdf",
+      "trust_tier": "UNKNOWN",
+      "deadline": {
+        "text": "15.04.2023",
+        "iso": "2023-04-15",
+        "days_left": -1306,
+        "is_past": true
+      }
+    }
+  ],
+  "improvement_plan": {
+    "summary": "2 suggestions; 1 near-miss opportunities could unlock with these fixes.",
+    "generated_by": "llm",
+    "suggestions": [
+      {
+        "title": "Apply for Funding",
+        "action": "Submit applications for the listed scholarship and grant programs.",
+        "rationale": "",
+        "category": "profile",
+        "priority": 1,
+        "unlocks": [
+          "5605e99c-9c02-4b1b-8825-0f2a086d272f",
+          "825a1599-6e90-4b8a-a159-9d143854a66a",
+          "16cec0b3-4b2a-4c4c-9f4b-04eb8ce0b934",
+          "a7395dd9-0df3-46db-ae46-e464cfa039e3",
+          "c5c994f2-4b1b-4941-9e5d-da69fcd6931e",
+          "973a9de7-39a4-455a-a821-57ef2fecb839",
+          "9e61e273-e93e-45df-a785-99f45fa43f89"
+        ],
+        "unlock_names": [
+          "Canadian Francophonie Scholarship Program",
+          "Canada Graduate Research Scholarship – Master's program (CGRS M)",
+          "Erasmus Mundus Joint Masters Scholarships",
+          "2026 Research Grants",
+          "Graduate Student Research Grants",
+          "DAAD Hilde Domin Scholarship",
+          "In-Region Scholarship Programme Central America"
+        ],
+        "deadline_hint": "-590 days"
+      },
+      {
+        "title": "Improve French Proficiency",
+        "action": "Enroll in a French language course to meet the required proficiency level.",
+        "rationale": "",
+        "category": "test",
+        "priority": 2,
+        "unlocks": [
+          "5605e99c-9c02-4b1b-8825-0f2a086d272f"
+        ],
+        "unlock_names": [
+          "Canadian Francophonie Scholarship Program"
+        ],
+        "deadline_hint": "-590 days"
+      }
+    ],
+    "near_miss_ids": [
+      "a7395dd9-0df3-46db-ae46-e464cfa039e3"
+    ]
+  },
+  "applications": {
+    "c5c994f2-4b1b-4941-9e5d-da69fcd6931e": {
+      "status": "ready",
+      "sop_text": "The purpose of this application is to demonstrate how the research interests and technical background of [CANDIDATE_NAME] align with the objectives of the Graduate Student Research Grants offered by the Geological Society of America (GSA) and to explain how the support will enable a transition from a strong foundation in computer science to interdisciplinary work that advances earth‑science research across the United States, Canada, and Mexico. [CANDIDATE_NAME] earned a B.Tech in Computer Science and Engineering at VIT Vellore, graduating with a GPA of 8.2/10.0 (≈3.70/4.0) and holding Indian citizenship. A solid academic record was complemented by an IELTS score of 7.0, confirming proficiency in English for graduate‑level study in North America. During the undergraduate program, [CANDIDATE_NAME] led the development of CampusConnect, a MERN‑stack campus event platform that served approximately 2,000 students, showcasing the ability to design scalable web applications for large user bases. In parallel, a machine‑learning pipeline named CropCast was created to predict crop yields; the model achieved 87 % accuracy on district‑level data, illustrating competence in data preprocessing, model training, and performance evaluation. An additional project, LedgerLite, delivered an offline‑first budgeting progressive web app that leveraged service workers to ensure functionality without continuous internet access, reflecting an understanding of resilient software architectures. Research experience was further deepened through an IEEE‑published paper on lightweight transformers for regional‑language optical character recognition, presented at INDICON 2025, which demonstrated expertise in adapting deep‑learning models to resource‑constrained environments and non‑English scripts. The culmination of these efforts was recognized when [CANDIDATE_NAME] won the Smart India Hackathon 2024, a national competition that rewards innovative problem‑solving under pressure. Motivated to extend these capabilities to the geosciences, [CANDIDATE_NAME] seeks a master’s degree in Computer Science, Data Science, or Artificial Intelligence, with the intention of applying advanced analytics, machine learning, and artificial‑intelligence techniques to geological datasets, remote‑sensing imagery, and climate‑impact models. By becoming a GSA member, [CANDIDATE_NAME] will meet the eligibility requirement and gain access to a professional network of geoscientists, which is essential for collaborative research and dissemination of results. The grant will enable [CANDIDATE_NAME] to focus on a research project that integrates lightweight transformer models with satellite‑derived multispectral data to improve the detection of mineralogical signatures in arid regions. The outcome will be a reproducible, open‑source toolkit that geologists can deploy on modest hardware in field settings, thereby expanding the reach of high‑resolution geological mapping. Because GSA policy limits each student to a maximum of two graduate‑student grants over an academic career, securing this award now will be pivotal for establishing a research trajectory that can later be supported by a second grant, ensuring continuity and depth in the proposed investigations. The financial assistance will cover a portion of tuition costs, allowing [CANDIDATE_NAME] to allocate more time to research, attend GSA conferences, and collaborate with faculty mentors who specialize in geoinformatics and computational geology. In summary, the combination of a strong academic record, proven software‑engineering and machine‑learning achievements, and a clear vision for applying these skills to geoscientific challenges makes [CANDIDATE_NAME] an ideal candidate for the Graduate Student Research Grants. The support will not only facilitate the completion of a master’s degree in a relevant discipline but also generate tools that benefit the broader geological community across North America. [CANDIDATE_NAME] looks forward to contributing to GSA’s mission of advancing the geosciences through innovative, data‑driven research.",
+      "word_count": 549,
+      "claim_ledger": [
+        {
+          "fact_id": "F1",
+          "source": "profile",
+          "field": "degree",
+          "value": "B.Tech in Computer Science and Engineering at VIT Vellore"
+        },
+        {
+          "fact_id": "F2",
+          "source": "profile",
+          "field": "gpa",
+          "value": "GPA 8.2/10.0 (≈3.70/4.0)"
+        },
+        {
+          "fact_id": "F3",
+          "source": "profile",
+          "field": "nationality",
+          "value": "Indian"
+        },
+        {
+          "fact_id": "F4",
+          "source": "profile",
+          "field": "language_test",
+          "value": "IELTS 7.0"
+        },
+        {
+          "fact_id": "F5",
+          "source": "profile",
+          "field": "project",
+          "value": "CampusConnect: MERN-stack campus event platform used by ~2,000 students"
+        },
+        {
+          "fact_id": "F6",
+          "source": "profile",
+          "field": "project",
+          "value": "CropCast: ML crop-yield prediction pipeline, 87% accuracy on district data"
+        },
+        {
+          "fact_id": "F7",
+          "source": "profile",
+          "field": "project",
+          "value": "LedgerLite: Offline-first budgeting PWA with service workers"
+        },
+        {
+          "fact_id": "F8",
+          "source": "profile",
+          "field": "research",
+          "value": "Lightweight Transformers for Regional-Language OCR (IEEE INDICON 2025)"
+        },
+        {
+          "fact_id": "F9",
+          "source": "profile",
+          "field": "experience",
+          "value": "Software Engineering Intern at Fintech startup (6 months)"
+        },
+        {
+          "fact_id": "F10",
+          "source": "profile",
+          "field": "award",
+          "value": "Smart India Hackathon 2024 — Winner"
+        },
+        {
+          "fact_id": "F11",
+          "source": "profile",
+          "field": "goals",
+          "value": "wants masters in Computer Science, Data Science, Artificial Intelligence"
+        },
+        {
+          "fact_id": "F12",
+          "source": "opportunity",
+          "field": "opp_name",
+          "value": "Graduate Student Research Grants"
+        },
+        {
+          "fact_id": "F13",
+          "source": "opportunity",
+          "field": "opp_provider",
+          "value": "Geological Society of America (GSA)"
+        },
+        {
+          "fact_id": "F14",
+          "source": "opportunity",
+          "field": "opp_country",
+          "value": "United States, Canada, Mexico"
+        },
+        {
+          "fact_id": "F15",
+          "source": "opportunity",
+          "field": "opp_funding",
+          "value": "UNKNOWN partial_tuition"
+        },
+        {
+          "fact_id": "F16",
+          "source": "opportunity",
+          "field": "opp_requirement",
+          "value": "Eligibility is restricted to GSA members."
+        },
+        {
+          "fact_id": "F17",
+          "source": "opportunity",
+          "field": "opp_requirement",
+          "value": "Applicants must be currently enrolled in a North American or Central American university or college in an earth science graduate degree program (with a geologic component)."
+        },
+        {
+          "fact_id": "F18",
+          "source": "opportunity",
+          "field": "opp_requirement",
+          "value": "Students may receive a total of two GSA graduate student grants in their entire academic career, regardless of what program currently enrolled in."
+        }
+      ],
+      "removed_claims": [
+        "A six‑month software‑engineering internship at a fintech startup provided industry exposure to secure transaction processing, API design, and agile development practices, reinforcing professional software‑engineering skills.",
+        "The Graduate Student Research Grants are designed to support exactly this type of interdisciplinary scholarship, providing partial tuition assistance to eligible graduate students who are members of GSA and are enrolled in an earth‑science graduate program with a geologic component in the United States, Canada, or Mexico.",
+        "This work builds directly on the prior experience with regional‑language OCR, where model compression and inference efficiency were critical, and on the CropCast pipeline, where accurate prediction from heterogeneous spatial data was demonstrated."
+      ],
+      "execution_checklist": [
+        "Apply: Apply online and ensure one appraisal from the primary advisor is submitted with each application.",
+        "Deadline: 18 February, 11:59 p.m. MST",
+        "Prepare transcripts, references and this statement of purpose"
+      ],
+      "error": null
+    }
+  },
+  "errors": [],
+  "leads": [
+    {
+      "name": "research grants",
+      "provider_hint": "",
+      "source_url": "https://daad.de/en/studying-in-germany/scholarships/daad-scholarships"
+    },
+    {
+      "name": "grant for a full Doctoral programme",
+      "provider_hint": "",
+      "source_url": "https://daad.de/en/studying-in-germany/scholarships/daad-scholarships"
+    },
+    {
+      "name": "Scholarships for a Master's degree",
+      "provider_hint": "",
+      "source_url": "https://daad.de/en/studying-in-germany/scholarships/daad-scholarships"
+    },
+    {
+      "name": "Study scholarships for STEM disciplines",
+      "provider_hint": "",
+      "source_url": "https://daad.de/en/studying-in-germany/scholarships/daad-scholarships"
+    },
+    {
+      "name": "Development-related Postgraduate Courses (EPOS)",
+      "provider_hint": "",
+      "source_url": "https://daad.de/en/studying-in-germany/scholarships/daad-scholarships"
+    },
+    {
+      "name": "Hilde Domin Programme",
+      "provider_hint": "",
+      "source_url": "https://daad.de/en/studying-in-germany/scholarships/daad-scholarships"
+    },
+    {
+      "name": "In-Country",
+      "provider_hint": "",
+      "source_url": "https://daad.de/en/studying-in-germany/scholarships/daad-scholarships"
+    },
+    {
+      "name": "In-Region",
+      "provider_hint": "",
+      "source_url": "https://daad.de/en/studying-in-germany/scholarships/daad-scholarships"
+    },
+    {
+      "name": "Erasmus Mundus Joint Master’s",
+      "provider_hint": "",
+      "source_url": "https://community.deeplearning.ai/t/academic-opportunities/884689"
+    },
+    {
+      "name": "Fulbright Program",
+      "provider_hint": "",
+      "source_url": "https://community.deeplearning.ai/t/academic-opportunities/884689"
+    },
+    {
+      "name": "DAAD",
+      "provider_hint": "",
+      "source_url": "https://community.deeplearning.ai/t/academic-opportunities/884689"
+    },
+    {
+      "name": "Chevening",
+      "provider_hint": "",
+      "source_url": "https://community.deeplearning.ai/t/academic-opportunities/884689"
+    },
+    {
+      "name": "GCUB International Mobility Program",
+      "provider_hint": "",
+      "source_url": "https://community.deeplearning.ai/t/academic-opportunities/884689"
+    },
+    {
+      "name": "Global Student Prize",
+      "provider_hint": "",
+      "source_url": "https://community.deeplearning.ai/t/academic-opportunities/884689"
+    },
+    {
+      "name": "Research Grants on Reducing Inequality",
+      "provider_hint": "",
+      "source_url": "https://wtgrantfoundation.org/funding/research-grants-on-improving-use-of-research-evidence"
+    },
+    {
+      "name": "Research Grants on Improving the Use of Research Evidence",
+      "provider_hint": "",
+      "source_url": "https://wtgrantfoundation.org/funding/research-grants-on-improving-use-of-research-evidence"
+    },
+    {
+      "name": "William T. Grant Scholars Program",
+      "provider_hint": "",
+      "source_url": "https://wtgrantfoundation.org/funding/research-grants-on-improving-use-of-research-evidence"
+    },
+    {
+      "name": "Institutional Challenge Grant",
+      "provider_hint": "",
+      "source_url": "https://wtgrantfoundation.org/funding/research-grants-on-improving-use-of-research-evidence"
+    },
+    {
+      "name": "Mentoring Grants",
+      "provider_hint": "",
+      "source_url": "https://wtgrantfoundation.org/funding/research-grants-on-improving-use-of-research-evidence"
+    },
+    {
+      "name": "Early-Career Reviewer Program",
+      "provider_hint": "",
+      "source_url": "https://wtgrantfoundation.org/funding/research-grants-on-improving-use-of-research-evidence"
+    },
+    {
+      "name": "Youth Service Capacity-Building Grants",
+      "provider_hint": "",
+      "source_url": "https://wtgrantfoundation.org/funding/research-grants-on-improving-use-of-research-evidence"
+    },
+    {
+      "name": "Youth Service Improvement Grants",
+      "provider_hint": "",
+      "source_url": "https://wtgrantfoundation.org/funding/research-grants-on-improving-use-of-research-evidence"
+    },
+    {
+      "name": "Clinical Research Grant",
+      "provider_hint": "",
+      "source_url": "https://ashfoundation.org/apply"
+    },
+    {
+      "name": "New Century Scholars Research Grant",
+      "provider_hint": "",
+      "source_url": "https://ashfoundation.org/apply"
+    },
+    {
+      "name": "New Investigators Research Grant",
+      "provider_hint": "",
+      "source_url": "https://ashfoundation.org/apply"
+    },
+    {
+      "name": "Student Research Grant in Audiology",
+      "provider_hint": "",
+      "source_url": "https://ashfoundation.org/apply"
+    },
+    {
+      "name": "In-Country/In-Region Programme Sub-Saharan Africa",
+      "provider_hint": "",
+      "source_url": "https://daad-kenya.org/en/in-country-in-region-programmes"
+    },
+    {
+      "name": "Staff Exchange Fellowships in Sub-Saharan-Africa",
+      "provider_hint": "",
+      "source_url": "https://daad-kenya.org/en/in-country-in-region-programmes"
+    },
+    {
+      "name": "Master’s Programme in German Studies at the University of Nairobi",
+      "provider_hint": "",
+      "source_url": "https://daad-kenya.org/en/in-country-in-region-programmes"
+    },
+    {
+      "name": "In-Country Scholarships for Postgraduate Studies for Palestinians in the Palestinian Territories (West Bank)• DAAD",
+      "provider_hint": "",
+      "source_url": "https://www2.daad.de/deutschland/stipendium/datenbank/en/21148-scholarship-database?back=1&page=2&q=in-country"
+    }
+  ]
+}

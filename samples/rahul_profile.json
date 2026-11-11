@@ -1,0 +1,78 @@
+{
+  "nationality": "Indian",
+  "current_country": "India",
+  "current_level": "bachelors",
+  "languages": ["English", "Hindi"],
+  "education": [
+    {
+      "degree": "B.Tech",
+      "field": "Computer Science and Engineering",
+      "institution": "VIT Vellore",
+      "level": "bachelors",
+      "country": "India",
+      "graduation_year": 2026,
+      "cgpa_value": 8.2,
+      "cgpa_scale": 10.0,
+      "grade_system": "standard"
+    }
+  ],
+  "skills": ["Python", "JavaScript", "React", "Node.js", "Machine Learning", "MongoDB", "SQL"],
+  "projects": [
+    {
+      "title": "CampusConnect",
+      "summary": "MERN-stack campus event platform used by ~2,000 students",
+      "technologies": ["React", "Node.js", "MongoDB"],
+      "source": "document"
+    },
+    {
+      "title": "CropCast",
+      "summary": "ML crop-yield prediction pipeline, 87% accuracy on district data",
+      "technologies": ["Python", "scikit-learn"],
+      "source": "document"
+    },
+    {
+      "title": "LedgerLite",
+      "summary": "Offline-first budgeting PWA with service workers",
+      "technologies": ["JavaScript", "IndexedDB"],
+      "source": "document"
+    }
+  ],
+  "research": [
+    {
+      "title": "Lightweight Transformers for Regional-Language OCR",
+      "kind": "publication",
+      "venue": "IEEE INDICON 2025",
+      "year": 2025
+    }
+  ],
+  "experience": [
+    {
+      "role": "Software Engineering Intern",
+      "organization": "Fintech startup",
+      "kind": "internship",
+      "duration_months": 6,
+      "summary": "Shipped a payment-reconciliation microservice"
+    }
+  ],
+  "activities": [
+    {"title": "Developer Student Club", "role": "Technical Lead",
+     "summary": "Ran 12 workshops for 300+ students"}
+  ],
+  "awards": [
+    {"name": "Smart India Hackathon 2024 — Winner", "year": 2024, "is_scholarship": false}
+  ],
+  "language_tests": [
+    {"test_name": "IELTS", "overall_score": 7.0}
+  ],
+  "financial_need": {"level": "full", "annual_budget_usd": null, "context": ""},
+  "preferences": {
+    "degree_level": "masters",
+    "target_fields": ["Computer Science", "Data Science"],
+    "countries": ["Canada", "Germany", "Singapore"],
+    "instruction_languages": ["English"],
+    "intake": "Fall 2026",
+    "funding_required": true
+  },
+  "completeness_flags": {},
+  "field_sources": {}
+}

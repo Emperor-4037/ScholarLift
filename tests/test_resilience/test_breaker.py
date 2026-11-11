@@ -12,7 +12,6 @@ State transitions tested:
 from __future__ import annotations
 
 import time
-import pytest
 
 from scholarship_finder.resilience.breaker import (
     BreakerState,
@@ -214,7 +213,7 @@ class TestBreakerRegistry:
 
     def test_get_domain_returns_per_domain_breaker(self):
         reg = BreakerRegistry()
-        b = reg.get_domain("example.com")
+        reg.get_domain("example.com")
         assert "fetch/example.com" in reg.all_states()
 
     def test_all_states_reflects_state_changes(self):

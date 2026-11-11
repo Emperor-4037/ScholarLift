@@ -1,0 +1,62 @@
+{
+  "nationality": "Nigerian",
+  "current_country": "Nigeria",
+  "current_level": "bachelors",
+  "languages": ["English", "Yoruba"],
+  "education": [
+    {
+      "degree": "BSc",
+      "field": "Nursing",
+      "institution": "University of Ibadan",
+      "level": "bachelors",
+      "country": "Nigeria",
+      "graduation_year": 2024,
+      "cgpa_value": 4.1,
+      "cgpa_scale": 5.0,
+      "grade_system": "standard"
+    }
+  ],
+  "skills": ["Community health", "Patient education", "Epidemiology basics", "Data collection", "Program coordination"],
+  "projects": [],
+  "research": [
+    {
+      "title": "Barriers to Antenatal Care Uptake in Rural Oyo State",
+      "kind": "publication",
+      "venue": "Undergraduate thesis, University of Ibadan",
+      "year": 2024
+    }
+  ],
+  "experience": [
+    {
+      "role": "Nursing Intern",
+      "organization": "University College Hospital Ibadan",
+      "kind": "internship",
+      "duration_months": 12,
+      "summary": "Paediatric and community health wards"
+    }
+  ],
+  "activities": [
+    {"title": "Maternal-health outreach programme", "role": "Volunteer Lead",
+     "summary": "Led 15 volunteers across 6 rural communities for 2 years"},
+    {"title": "Measles vaccination drive", "role": "Coordinator",
+     "summary": "Reached ~4,000 residents"}
+  ],
+  "awards": [
+    {"name": "Faculty Community Service Award", "year": 2024, "is_scholarship": false}
+  ],
+  "language_tests": [
+    {"test_name": "IELTS", "overall_score": 6.0}
+  ],
+  "financial_need": {"level": "full", "annual_budget_usd": null,
+    "context": "First-generation graduate; seeking fully funded public-health masters"},
+  "preferences": {
+    "degree_level": "masters",
+    "target_fields": ["Public Health", "Epidemiology"],
+    "countries": ["UK", "Australia"],
+    "instruction_languages": ["English"],
+    "intake": "2026",
+    "funding_required": true
+  },
+  "completeness_flags": {},
+  "field_sources": {}
+}

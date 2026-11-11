@@ -1,370 +1,285 @@
-"""OpenAI-compatible LLM adapter — works with any OpenAI-style REST endpoint.
+"""OpenAI-compatible LLM provider — implements the LLMProvider protocol.
 
-Supports: Groq, OpenRouter, GitHub Models, local Ollama, etc.
-Configured entirely by base URL + model name + capability declaration in settings.
-All vendor errors mapped to the normalized error taxonomy.
+Used for Groq (base_url=https://api.groq.com/openai/v1) and any other
+OpenAI-compatible endpoint. The :class:`LLMRouter` picks the model; this
+adapter only knows how to talk to one vendor endpoint.
+
+- ``AsyncOpenAI`` clients are cached per running event loop (each run gets
+  its own loop on a background thread, so a shared client breaks on the
+  second run).
+- ``json_mode`` → ``response_format={"type": "json_object"}``.
+- ``reasoning_effort`` is sent where supported; on a 400 rejection the
+  call is retried once without it.
+- Rate-limit headers (``x-ratelimit-remaining-tokens`` /
+  ``x-ratelimit-reset-tokens``) are reported to the router's limiter via
+  :class:`~scholarship_finder.ports.llm.RateInfo`.
+- All SDK exceptions are mapped to the normalized error taxonomy.
 """
 from __future__ import annotations
 
-import json
-import time
-from typing import Any, AsyncIterator
+import asyncio
+import base64
+import logging
+from typing import Any, Callable
 
-from scholarship_finder.domain.models import LLMTier
+import openai
+from openai import AsyncOpenAI
+
 from scholarship_finder.errors import (
     AdapterError,
     AuthError,
-    ContentBlockedError,
     ContextTooLongError,
     ModelUnavailableError,
-    QuotaExhaustedError,
     RateLimitedError,
     RateLimitScope,
-    SchemaViolationError,
-    TimeoutError as SFTimeoutError,
     TransientError,
     UnknownAdapterError,
 )
-from scholarship_finder.ports.llm import LLMResult, LLMUsage, TaskSpec
+from scholarship_finder.ports.llm import LLMResult, LLMUsage, RateInfo, TaskSpec
 
-try:
-    from openai import AsyncOpenAI, APIStatusError, APIConnectionError, APITimeoutError
-    _OPENAI_AVAILABLE = True
-except ImportError:
-    _OPENAI_AVAILABLE = False
+logger = logging.getLogger(__name__)
 
-PROVIDER = "openai_compat"
+_RATE_HEADER_REMAINING = "x-ratelimit-remaining-tokens"
+_RATE_HEADER_RESET = "x-ratelimit-reset-tokens"
+_RATE_HEADER_REMAINING_REQ = "x-ratelimit-remaining-requests"
 
 
-def _map_error(exc: Exception, model: str) -> Exception:
-    """Translate openai SDK exceptions → normalized error taxonomy."""
-    if not _OPENAI_AVAILABLE:
-        return UnknownAdapterError(PROVIDER, "openai not installed", exc)
-
-    if isinstance(exc, APIStatusError):
-        status = exc.status_code
-        msg = str(exc.message)
-        if status == 429:
-            retry_after = 0.0
-            if hasattr(exc, "response") and exc.response is not None:
-                ra = exc.response.headers.get("retry-after", "0")
-                try:
-                    retry_after = float(ra)
-                except ValueError:
-                    pass
-            if retry_after > 60:
-                return QuotaExhaustedError(PROVIDER, f"Daily quota exhausted for {model}")
-            return RateLimitedError(
-                PROVIDER, f"Rate limited: {msg}", RateLimitScope.MINUTE, retry_after
-            )
-        if status in (401, 403):
-            return AuthError(PROVIDER, f"Auth failed: {msg}")
-        if status == 404:
-            return ModelUnavailableError(PROVIDER, f"Model {model} not found: {msg}")
-        if status in (500, 502, 503):
-            return TransientError(PROVIDER, f"Server error {status}: {msg}")
-        if "context" in msg.lower() and ("length" in msg.lower() or "token" in msg.lower()):
-            return ContextTooLongError(PROVIDER, f"Context too long for {model}: {msg}")
-        if "content_filter" in msg.lower() or "safety" in msg.lower():
-            return ContentBlockedError(PROVIDER, f"Content blocked: {msg}")
-
-    if isinstance(exc, APITimeoutError):
-        return SFTimeoutError(PROVIDER, f"Timeout on {model}")
-
-    if isinstance(exc, APIConnectionError):
-        return TransientError(PROVIDER, f"Connection error: {exc}")
-
-    return UnknownAdapterError(PROVIDER, f"Unexpected: {exc}", exc)
+def _parse_reset_seconds(value: str | None) -> float | None:
+    """Parse Groq-style reset headers ("6s", "1m30s", "500ms") into seconds."""
+    if not value:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        pass
+    total = 0.0
+    num = ""
+    for ch in value.strip():
+        if ch.isdigit() or ch == ".":
+            num += ch
+        else:
+            try:
+                part = float(num) if num else 0.0
+            except ValueError:
+                part = 0.0
+            num = ""
+            if ch == "m" and "s" not in value[value.index(ch):]:
+                total += part * 60.0
+            elif ch == "h":
+                total += part * 3600.0
+            elif ch == "s":
+                total += part
+    return total or None
 
 
-class OpenAICompatAdapter:
-    """Adapter for any OpenAI-compatible endpoint.
+class OpenAICompatProvider:
+    """One OpenAI-compatible endpoint (Groq, OpenAI, Together, ...).
 
     Args:
-        api_key:      Bearer token / API key.
-        base_url:     Base URL of the compatible endpoint (e.g. https://api.groq.com/openai/v1).
-        model_id:     Model name as expected by the endpoint.
-        tier:         Logical tier this adapter serves.
-        may_train:    Whether the provider may use prompts for training.
-        supports_json_schema: Whether the endpoint supports strict JSON schema output.
-        bus:          Optional EventBus for error reporting.
+        name:     Provider label used in results/telemetry ("groq", "openai").
+        api_key:  API key for the endpoint.
+        base_url: Endpoint base URL ("" → SDK default, OpenAI only).
     """
 
-    def __init__(
-        self,
-        api_key: str,
-        base_url: str,
-        model_id: str,
-        tier: LLMTier,
-        may_train: bool = False,
-        supports_json_schema: bool = True,
-        bus=None,
-    ) -> None:
-        if not _OPENAI_AVAILABLE:
-            raise ImportError("openai package not installed. Run: pip install openai")
-        self._model_id = model_id
-        self._tier = tier
-        self._may_train = may_train
-        self._supports_json = supports_json_schema
-        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url or None)
-        self._bus = bus  # Optional EventBus for error reporting
+    def __init__(self, name: str, api_key: str, base_url: str = "") -> None:
+        self.name = name
+        self._api_key = api_key
+        self._base_url = base_url or None
+        # Clients are bound to the loop that created them — keep one per loop.
+        self._clients: dict[asyncio.AbstractEventLoop, AsyncOpenAI] = {}
+        self._rate_observer: Callable[[str, RateInfo | None], None] | None = None
 
-    async def complete(self, spec: TaskSpec) -> LLMResult:
+    # ── Client lifecycle ─────────────────────────────────────────────────────
+
+    def _client(self) -> AsyncOpenAI:
+        loop = asyncio.get_running_loop()
+        client = self._clients.get(loop)
+        if client is None:
+            kwargs: dict[str, Any] = {"api_key": self._api_key}
+            if self._base_url:
+                kwargs["base_url"] = self._base_url
+            client = AsyncOpenAI(**kwargs)
+            self._clients[loop] = client
+        return client
+
+    async def aclose(self) -> None:
+        """Close the client bound to the current loop (call at run end)."""
+        loop = asyncio.get_running_loop()
+        client = self._clients.pop(loop, None)
+        if client is not None:
+            try:
+                await client.close()
+            except Exception:
+                logger.debug("OpenAICompatProvider: client close failed", exc_info=True)
+
+    def set_rate_observer(self, observer: Callable[[str, RateInfo | None], None]) -> None:
+        """Register a callback ``(model, RateInfo|None)`` fed after each call."""
+        self._rate_observer = observer
+
+    # ── Generation ───────────────────────────────────────────────────────────
+
+    async def generate(self, model: str, spec: TaskSpec) -> LLMResult:
+        """One completion call; raises mapped AdapterError subclasses."""
         messages = self._build_messages(spec)
         kwargs: dict[str, Any] = {
-            "model": self._model_id,
+            "model": model,
             "messages": messages,
             "max_tokens": spec.max_output_tokens,
             "temperature": spec.temperature,
         }
-        if spec.output_schema and self._supports_json:
-            kwargs["response_format"] = {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "response",
-                    "strict": True,
-                    "schema": spec.output_schema,
-                },
-            }
-        t0 = time.monotonic()
+        if spec.json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+        if spec.reasoning_effort:
+            kwargs["reasoning_effort"] = spec.reasoning_effort
+        if "gpt-oss" in model.lower():
+            # gpt-oss spends reasoning tokens out of max_tokens — headroom so
+            # visible content isn't starved even at low effort.
+            kwargs["max_tokens"] = spec.max_output_tokens + 1500
+
         try:
-            response = await self._client.chat.completions.create(**kwargs)
-        except Exception as exc:
-            mapped_error = _map_error(exc, self._model_id)
-            # Publish error event if EventBus is available
-            if self._bus:
-                from scholarship_finder.domain.models import Event, EventKind, EventSeverity
-                from datetime import datetime, timezone
+            completion, rate = await self._call(model, kwargs)
+        except openai.BadRequestError as exc:
+            # Some endpoints reject reasoning_effort — drop it once and retry.
+            if "reasoning_effort" in kwargs and self._is_param_rejection(exc):
+                kwargs.pop("reasoning_effort", None)
                 try:
-                    await self._bus.publish(Event(
-                        run_id=spec.data_blocks[0].get("run_id", "unknown") if spec.data_blocks else "unknown",
-                        seq=0,
-                        timestamp=datetime.now(timezone.utc),
-                        node="llm_openai",
-                        severity=EventSeverity.ERROR,
-                        kind=EventKind.ERROR,
-                        payload={
-                            "model": self._model_id,
-                            "error_type": type(mapped_error).__name__,
-                            "message": str(mapped_error),
-                        }
-                    ))
-                except Exception:
-                    pass  # Don't let event publishing fail the LLM call
-            raise mapped_error from exc
-
-        latency_ms = (time.monotonic() - t0) * 1000
-        return self._parse_response(response, spec, latency_ms)
-
-    async def stream(self, spec: TaskSpec) -> AsyncIterator[str]:
-        messages = self._build_messages(spec)
-        try:
-            stream = self._client.chat.completions.create(
-                model=self._model_id,
-                messages=messages,
-                max_tokens=spec.max_output_tokens,
-                temperature=spec.temperature,
-                stream=True,
-            )
-            async for chunk in stream:
-                try:
-                    if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
-                        yield chunk.choices[0].delta.content
-                except (AttributeError, IndexError):
-                    pass
+                    completion, rate = await self._call(model, kwargs)
+                except Exception as exc2:
+                    raise self._map_error(exc2, model) from exc2
+            else:
+                raise self._map_error(exc, model) from exc
         except Exception as exc:
-            raise _map_error(exc, self._model_id) from exc
-        yield ""  # sentinel
-
-    def capabilities(self) -> dict[str, Any]:
-        return {
-            "native_json_schema": self._supports_json,
-            "streaming": True,
-            "vision": False,
-            "max_context_tokens": 128_000,
-            "max_output_tokens": 8192,
-            "reasoning_control": False,
-            "may_train": self._may_train,
-            "data_policy": "openai_compatible",
-            "provider": PROVIDER,
-            "model": self._model_id,
-            "tier": self._tier.value,
-        }
-
-    # ── Private helpers ───────────────────────────────────────────────────────
-
-    def _build_messages(self, spec: TaskSpec) -> list[dict[str, str]]:
-        user_parts = []
-        for block in spec.data_blocks:
-            label = block.get("label", "DATA")
-            content = block.get("content", "")
-            user_parts.append(f"--- {label} ---\n{content}\n--- END {label} ---")
-        return [
-            {"role": "system", "content": spec.instruction},
-            {"role": "user", "content": "\n\n".join(user_parts) if user_parts else "Begin."},
-        ]
-
-    def _parse_response(self, response: Any, spec: TaskSpec, latency_ms: float) -> LLMResult:
-        choice = response.choices[0] if response.choices else None
-        text = (choice.message.content or "") if choice else ""
-        usage_obj = getattr(response, "usage", None)
-        usage = LLMUsage(
-            input_tokens=getattr(usage_obj, "prompt_tokens", 0) or 0,
-            output_tokens=getattr(usage_obj, "completion_tokens", 0) or 0,
-            latency_ms=latency_ms,
-        )
-        parsed = None
-        if spec.output_schema and text:
-            try:
-                parsed = json.loads(text)
-            except json.JSONDecodeError as e:
-                raise SchemaViolationError(PROVIDER, f"JSON parse failed: {e}", raw_output=text) from e
-        return LLMResult(
-            content=text, parsed=parsed, usage=usage,
-            provider=PROVIDER, model=self._model_id, tier=self._tier,
-        )
-
-
-class OpenAILLMAdapter:
-    """Multi-tier LLM adapter wrapping OpenAI-compatible endpoints (Groq, OpenRouter, etc.)."""
-
-    def __init__(self, api_key: str, settings: Any = None, bus=None) -> None:
-        self._api_key = api_key
-        self._settings = settings
-        self._bus = bus  # Optional EventBus for error reporting
-        base_url = (
-            getattr(settings, "groq_api_base_url", "")
-            or getattr(settings, "openai_api_base_url", "")
-            or ""
-        ).strip()
-        if not base_url and (
-            getattr(settings, "groq_api_key", "")
-            or api_key.startswith("gsk_")
-        ):
-            base_url = "https://api.groq.com/openai/v1"
-        self._base_url = base_url.rstrip("/") if base_url else ""
-        self._adapters: dict[str, OpenAICompatAdapter] = {}
-
-    def _get_adapter(self, tier: LLMTier) -> OpenAICompatAdapter:
-        model = None
-        if self._settings:
-            if tier == LLMTier.REASONING:
-                models = [m for m in self._settings.reasoning_models() if not m.startswith("gemini")]
-                if models:
-                    model = models[0]
-            elif tier == LLMTier.VISION:
-                models = [m for m in self._settings.vision_models() if not m.startswith("gemini")]
-                if models:
-                    model = models[0]
-            else:
-                models = [m for m in self._settings.fast_models() if not m.startswith("gemini")]
-                if models:
-                    model = models[0]
-
-        if not model:
-            if "groq.com" in self._base_url:
-                # Use Groq GPT-OSS models
-                model = "openai/gpt-oss-120b" if tier == LLMTier.REASONING else "openai/gpt-oss-20b"
-            else:
-                model = "gpt-4o" if tier == LLMTier.REASONING else "gpt-4o-mini"
-
-        cache_key = f"{model}:{tier.value}"
-        if cache_key not in self._adapters:
-            self._adapters[cache_key] = OpenAICompatAdapter(
-                api_key=self._api_key,
-                base_url=self._base_url,
-                model_id=model,
-                tier=tier,
-                bus=self._bus,
-            )
-        return self._adapters[cache_key]
-
-    async def complete(self, spec: TaskSpec) -> LLMResult:
-        """Try models in chain with fallback on transient/quota errors."""
-        import asyncio
-        import logging
-        from scholarship_finder.errors import (
-            QuotaExhaustedError, AdapterError, TransientError as SFTransientError,
-            ModelUnavailableError, RateLimitedError,
-        )
-
-        logger = logging.getLogger(__name__)
-
-        # Get model chain for this tier - filter to only non-Gemini models
-        if self._settings:
-            if spec.tier == LLMTier.REASONING:
-                models = [m for m in self._settings.reasoning_models() if not m.startswith("gemini")]
-            elif spec.tier == LLMTier.VISION:
-                models = [m for m in self._settings.vision_models() if not m.startswith("gemini")]
-            else:
-                models = [m for m in self._settings.fast_models() if not m.startswith("gemini")]
-        else:
-            models = []
-
-        if not models:
-            # No models configured, use default
-            adapter = self._get_adapter(spec.tier)
-            return await adapter.complete(spec)
-
-        # Try each model in the chain
-        last_error = None
-        for model in models:
-            try:
-                adapter = self._get_adapter_for_model(spec.tier, model)
-                return await adapter.complete(spec)
-            except Exception as exc:
-                last_error = exc
-                if isinstance(exc, (QuotaExhaustedError, ModelUnavailableError)):
-                    logger.warning("Model %s unavailable/exhausted, trying next in chain: %s", model, exc)
-                    continue
-                elif isinstance(exc, (SFTransientError, RateLimitedError)):
-                    logger.warning("Model %s transient error, retrying once: %s", model, exc)
-                    try:
-                        await asyncio.sleep(2.0)
-                        adapter2 = self._get_adapter_for_model(spec.tier, model)
-                        return await adapter2.complete(spec)
-                    except Exception as exc2:
-                        logger.warning("Model %s retry also failed, trying next in chain: %s", model, exc2)
-                        last_error = exc2
-                        continue
-                elif isinstance(exc, AdapterError):
-                    logger.warning("Model %s failed, trying next in chain: %s", model, exc)
-                    continue
+            if isinstance(exc, AdapterError):
                 raise
+            raise self._map_error(exc, model) from exc
 
-        if last_error:
-            raise last_error
-        raise RuntimeError("No models available in chain")
+        usage = LLMUsage()
+        if completion.usage is not None:
+            usage.input_tokens = completion.usage.prompt_tokens or 0
+            usage.output_tokens = completion.usage.completion_tokens or 0
+            details = getattr(completion.usage, "completion_tokens_details", None)
+            usage.reasoning_tokens = getattr(details, "reasoning_tokens", 0) or 0
 
-    async def stream(self, spec: TaskSpec) -> AsyncIterator[str]:
-        """Stream from the first available model."""
-        adapter = self._get_adapter(spec.tier)
-        async for chunk in adapter.stream(spec):
-            yield chunk
+        content = ""
+        finish = ""
+        if completion.choices:
+            content = completion.choices[0].message.content or ""
+            finish = getattr(completion.choices[0], "finish_reason", "") or ""
+        if not content:
+            raise TransientError(
+                self.name,
+                f"{model}: empty content (finish_reason={finish or '?'})")
 
-    def _get_adapter_for_model(self, tier: LLMTier, model: str) -> OpenAICompatAdapter:
-        """Get adapter for a specific model name."""
-        cache_key = f"{model}:{tier.value}"
-        if cache_key not in self._adapters:
-            self._adapters[cache_key] = OpenAICompatAdapter(
-                api_key=self._api_key,
-                base_url=self._base_url,
-                model_id=model,
-                tier=tier,
-                bus=self._bus,
+        return LLMResult(
+            content=content,
+            usage=usage,
+            provider=self.name,
+            model=model,
+            tier=spec.tier,
+            rate=rate,
+        )
+
+    async def _call(self, model: str, kwargs: dict[str, Any]) -> tuple[Any, RateInfo]:
+        client = self._client()
+        try:
+            raw = await client.chat.completions.with_raw_response.create(**kwargs)
+        except openai.APIStatusError as exc:
+            raise self._map_error(exc, model) from exc
+        except openai.APIConnectionError as exc:
+            raise TransientError(self.name, f"{model}: connection error: {exc}") from exc
+        except openai.APITimeoutError as exc:
+            raise TransientError(self.name, f"{model}: request timeout: {exc}") from exc
+        except asyncio.TimeoutError as exc:
+            raise TransientError(self.name, f"{model}: request timeout") from exc
+        except Exception as exc:
+            raise UnknownAdapterError(self.name, f"{model}: {exc}", exc) from exc
+
+        completion = raw.parse()
+        rate = RateInfo(
+            remaining_tokens=_int_or_none(raw.headers.get(_RATE_HEADER_REMAINING)),
+            reset_tokens_s=_parse_reset_seconds(raw.headers.get(_RATE_HEADER_RESET)),
+            remaining_requests=_int_or_none(raw.headers.get(_RATE_HEADER_REMAINING_REQ)),
+        )
+        if self._rate_observer is not None:
+            try:
+                self._rate_observer(model, rate)
+            except Exception:
+                logger.debug("rate observer failed", exc_info=True)
+        return completion, rate
+
+    # ── Helpers ──────────────────────────────────────────────────────────────
+
+    def _build_messages(self, spec: TaskSpec) -> list[dict[str, Any]]:
+        messages: list[dict[str, Any]] = []
+        if spec.system:
+            messages.append({"role": "system", "content": spec.system})
+        if spec.images:
+            content: list[dict[str, Any]] = [{"type": "text", "text": spec.prompt or "Describe this image."}]
+            for img in spec.images:
+                b64 = base64.b64encode(img).decode("ascii")
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{b64}"},
+                })
+            messages.append({"role": "user", "content": content})
+        else:
+            messages.append({"role": "user", "content": spec.prompt or "Begin."})
+        return messages
+
+    @staticmethod
+    def _is_param_rejection(exc: openai.BadRequestError) -> bool:
+        msg = str(exc).lower()
+        return "reasoning_effort" in msg or "unsupported parameter" in msg or "unknown parameter" in msg
+
+    def _map_error(self, exc: Exception, model: str) -> AdapterError:
+        provider = self.name
+        if isinstance(exc, openai.RateLimitError):
+            retry_after = 0.0
+            headers = getattr(exc.response, "headers", None)
+            if headers is not None:
+                retry_after = _parse_reset_seconds(headers.get("retry-after")) or 0.0
+            return RateLimitedError(
+                provider, f"{model}: rate limited: {exc}",
+                scope=RateLimitScope.MINUTE, retry_after=retry_after,
             )
-        return self._adapters[cache_key]
+        if isinstance(exc, openai.AuthenticationError):
+            return AuthError(provider, f"{model}: authentication failed: {exc}")
+        if isinstance(exc, openai.PermissionDeniedError):
+            return AuthError(provider, f"{model}: permission denied: {exc}")
+        if isinstance(exc, openai.NotFoundError):
+            return ModelUnavailableError(provider, f"{model}: not found: {exc}")
+        if isinstance(exc, openai.BadRequestError):
+            if _looks_like_context_error(exc):
+                return ContextTooLongError(provider, f"{model}: context too long: {exc}")
+            return TransientError(provider, f"{model}: bad request: {exc}")
+        if isinstance(exc, openai.InternalServerError):
+            return TransientError(provider, f"{model}: server error: {exc}")
+        if isinstance(exc, openai.APIStatusError):
+            if exc.status_code >= 500:
+                return TransientError(provider, f"{model}: server error {exc.status_code}")
+            if exc.status_code == 413:
+                return ContextTooLongError(provider, f"{model}: payload too large")
+            return TransientError(provider, f"{model}: HTTP {exc.status_code}: {exc}")
+        if isinstance(exc, (openai.APIConnectionError, openai.APITimeoutError)):
+            return TransientError(provider, f"{model}: connection/timeout: {exc}")
+        return UnknownAdapterError(provider, f"{model}: {exc}", exc)
+def _looks_like_context_error(exc: openai.BadRequestError) -> bool:
+    msg = str(exc).lower()
+    code = ""
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error") or {}
+        code = str(err.get("code", "")).lower()
+    return (
+        "context_length" in msg or "context length" in msg or "context_length" in code
+        or "maximum context" in msg or "too many tokens" in msg or "reduce the length" in msg
+    )
 
-    def capabilities(self) -> dict[str, Any]:
-        return {
-            "native_json_schema": True,
-            "streaming": True,
-            "vision": False,
-            "max_context_tokens": 128_000,
-            "max_output_tokens": 8192,
-            "reasoning_control": False,
-            "may_train": False,
-            "data_policy": "openai_compatible",
-            "provider": PROVIDER,
-        }
+
+def _int_or_none(value: str | None) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
 

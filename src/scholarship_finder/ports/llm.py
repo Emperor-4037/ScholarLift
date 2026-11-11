@@ -1,33 +1,35 @@
 """LLM port contract — vendor-neutral capability gateway.
 
-Agents request a capability tier (fast / reasoning / vision).
-The router selects the first viable adapter from the configured chain.
-No model ID or vendor type ever crosses this boundary into the core.
+Agents request a capability tier (fast / reasoning / vision); the router picks
+the model. No model ID or vendor type ever crosses this boundary into agents.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Protocol
+from typing import Any, Protocol
 
 from scholarship_finder.domain.models import LLMTier
 
 
 @dataclass
 class TaskSpec:
-    """Provider-neutral task description passed to the LLM port.
-
-    The adapter renders this into its vendor's message format.
-    Never contains vendor-specific fields.
-    """
+    """Provider-neutral task description."""
     tier: LLMTier
-    instruction: str                        # System-level instruction
-    data_blocks: list[dict[str, str]] = field(default_factory=list)
-    # Each block: {"label": "RESUME_TEXT", "content": "..."}
-    output_schema: dict[str, Any] | None = None  # Portable Schema Profile JSON schema
-    max_output_tokens: int = 4096
-    reasoning_effort: str = "none"          # "none" | "low" | "medium" | "high"
-    data_sensitive: bool = False            # True → only adapters with may_train=False
+    system: str                              # instructions (system message)
+    prompt: str = "Begin."                   # task data (user message)
+    json_mode: bool = False                  # ask for a JSON object / array response
+    max_output_tokens: int = 2048
     temperature: float = 0.2
+    reasoning_effort: str = "low"            # "low" | "medium" | "high" (where supported)
+    purpose: str = ""                        # telemetry label, e.g. "profile_extraction"
+    images: list[bytes] = field(default_factory=list)   # PNG bytes for vision tasks
+    json_schema: dict | None = None  # schema-constrained JSON (local llama.cpp)
+
+    def estimated_input_tokens(self) -> int:
+        return int((len(self.system) + len(self.prompt)) / 3.5) + 50 + 1000 * len(self.images)
+
+    def estimated_total_tokens(self) -> int:
+        return self.estimated_input_tokens() + self.max_output_tokens
 
 
 @dataclass
@@ -39,39 +41,43 @@ class LLMUsage:
 
 
 @dataclass
+class RateInfo:
+    """Provider rate-limit headers, when exposed (Groq/OpenAI)."""
+    remaining_tokens: int | None = None
+    reset_tokens_s: float | None = None
+    remaining_requests: int | None = None
+
+
+@dataclass
 class LLMResult:
-    """Normalized result returned by any LLM adapter."""
-    content: str                            # Raw text or JSON string
-    parsed: Any | None = None              # Pydantic model if schema was provided
+    """Normalized result returned by the router."""
+    content: str
+    parsed: Any | None = None              # parsed JSON when json_mode=True
     usage: LLMUsage = field(default_factory=LLMUsage)
     provider: str = ""
     model: str = ""
     tier: LLMTier = LLMTier.FAST
-    downshifted: bool = False              # True if a lower tier was used
+    fallback_used: bool = False
+    attempts: list[str] = field(default_factory=list)
+    rate: RateInfo | None = None
+
+
+class LLMProvider(Protocol):
+    """One vendor endpoint; generates with an explicit model ID."""
+
+    name: str
+
+    async def generate(self, model: str, spec: TaskSpec) -> LLMResult:
+        ...
 
 
 class LLMPort(Protocol):
-    """Narrow interface implemented by every LLM adapter."""
+    """Interface agents depend on."""
 
     async def complete(self, spec: TaskSpec) -> LLMResult:
-        """Return a structured or plain-text completion."""
+        """Plain or JSON completion (parsed result in ``.parsed`` when json_mode)."""
         ...
 
-    async def stream(self, spec: TaskSpec) -> AsyncIterator[str]:
-        """Yield text deltas; final chunk is empty string."""
-        ...
-
-    def capabilities(self) -> dict[str, Any]:
-        """Return adapter capability flags.
-
-        Expected keys:
-          - native_json_schema: bool
-          - streaming: bool
-          - vision: bool
-          - max_context_tokens: int
-          - max_output_tokens: int
-          - reasoning_control: bool
-          - may_train: bool | None   (None = unknown)
-          - data_policy: str
-        """
+    def available(self) -> bool:
+        """True when at least one provider is configured."""
         ...

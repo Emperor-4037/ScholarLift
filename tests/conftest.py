@@ -9,11 +9,18 @@ from scholarship_finder.domain.models import (
     NormalizedGPA,
     Preferences,
     Project,
-    RunDeadlines,
-    RunMeta,
     SwarmState,
 )
 from scholarship_finder.domain.pii import PIIVault
+
+
+@pytest.fixture(autouse=True)
+def _isolated_kb(tmp_path, monkeypatch):
+    """Every test gets a fresh, empty knowledge base (never runs/knowledge.db)."""
+    from scholarship_finder.adapters import knowledge_base
+    monkeypatch.setattr(knowledge_base, "_KB", knowledge_base.KnowledgeBase(tmp_path / "kb.db"))
+    yield
+    knowledge_base._KB = None
 
 
 @pytest.fixture()

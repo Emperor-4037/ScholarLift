@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import time
 
-import pytest
 
 from scholarship_finder.domain.pii import PIIScrubber, PIIVault, _GITHUB_URL_RE, scrub_text
 

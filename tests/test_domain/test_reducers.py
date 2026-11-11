@@ -16,8 +16,6 @@ from scholarship_finder.domain.models import (
     SearchPlan,
     TrustTier,
     VerificationResult,
-    CandidateProfile,
-    Preferences,
     ApplicationPackage,
     SOPSentence,
 )
@@ -90,14 +88,14 @@ class TestReduceRunMeta:
         with pytest.raises(ValueError, match="already set"):
             reduce_run_meta(m1, {"outcome": RunOutcome.DEGRADED})
 
-    def test_budget_increment_allowed(self, fresh_meta):
-        result = reduce_run_meta(fresh_meta, {"budgets": {"reasoning_calls_used": 2}})
-        assert result.budgets.reasoning_calls_used == 2
+    def test_expansion_rounds_increment_allowed(self, fresh_meta):
+        result = reduce_run_meta(fresh_meta, {"expansion_rounds": 1})
+        assert result.expansion_rounds == 1
 
-    def test_budget_decrement_raises(self, fresh_meta):
-        m1 = reduce_run_meta(fresh_meta, {"budgets": {"reasoning_calls_used": 2}})
+    def test_expansion_rounds_decrement_raises(self, fresh_meta):
+        m1 = reduce_run_meta(fresh_meta, {"expansion_rounds": 1})
         with pytest.raises(ValueError, match="cannot decrease"):
-            reduce_run_meta(m1, {"budgets": {"reasoning_calls_used": 1}})
+            reduce_run_meta(m1, {"expansion_rounds": 0})
 
     def test_degradation_flags_appended(self, fresh_meta):
         m1 = reduce_run_meta(fresh_meta, {"degradation_flags": ["no_github"]})

@@ -1,245 +1,248 @@
-"""LangGraph Run Engine — wires the 5-agent pipeline into a StateGraph.
+"""LangGraph Run Engine — wires the agent pipeline into a StateGraph.
 
-Graph topology (architecture §1.2):
-    INTAKE → A1 (ProfileEnricher) → A2 (OpportunityScout)
-           → R1 (routing: enough candidates?) → [retry A2 | A3 (SourceAuditor)]
-           → A3 (wave fetch + listing expansion) → R2 (enough verified opps?)
-           → A4 (RankingStrategist) → PHASE_A_READY → R3 (SOP needed?)
-           → A5 (ApplicationStrategist) → END
+Topology (plan §3 Step D):
 
-Routing predicates R1, R2, R3 are pure deterministic Python functions — no LLM.
+    profile_enricher → opportunity_scout → source_auditor ─R─┐
+                         ▲ (lead expansion, max 1 round) ◀───┘
+                       ranking_strategist ──┬─ gap_advisor ──┤
+                                           └─ application_strategist ─▶ finalize
 
-Phase A hard stop enforced via asyncio timeout in RunGateway.
-Phase A PHASE_A_READY event emitted after A4 completes (top-5 ready).
-Phase B (A5) runs after PHASE_A_READY, within its own 120s budget.
-
-Dependency injection: all adapters passed via GraphConfig — no global singletons.
+Nodes return **partial dict updates**; a node's full-state return value
+(legacy agents) is normalised to an update automatically. Routing
+predicates are pure functions of state. Deadlines/cancellation are
+enforced by the RunGateway around the stream, plus ``RunContext`` checks.
 """
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any, AsyncIterator, Callable
 
 from langgraph.graph import END, StateGraph
 
 from scholarship_finder.domain.models import (
-    Event,
     EventKind,
     EventSeverity,
     RunOutcome,
     RunPhase,
     SwarmState,
 )
+from scholarship_finder.engine import context as run_context
 from scholarship_finder.engine.event_bus import EventBus
 
 logger = logging.getLogger(__name__)
 
-# Minimum candidates before skipping the retry round
-# Hackathon requirement: find at least 10 opportunities
-_MIN_CANDIDATES_BEFORE_RETRY = 10  # Challenge spec: find at least 10 opportunities
-# Minimum verified opportunities to proceed to ranking
-_MIN_OPPORTUNITIES = 1            # Allow proceeding with 1 opportunity for demo purposes
+
+# ── Node-result normalisation ────────────────────────────────────────────────
+
+def _to_update(result: Any) -> dict[str, Any]:
+    """Normalise an agent's return value to a partial state update dict."""
+    if result is None:
+        return {}
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, SwarmState):
+        return result.model_dump()
+    return {}
+
+
+def _advance_phase(update: dict[str, Any], state: SwarmState, phase: RunPhase) -> dict[str, Any]:
+    """Overlay a monotonic phase advance onto a node update."""
+    meta = state.run_meta.model_copy(update={"phase": phase})
+    update["run_meta"] = meta
+    return update
 
 
 # ── Routing predicates (pure code — no LLM) ───────────────────────────────────
 
-def _r1_enough_candidates(state: SwarmState) -> str:
-    """R1: Do we have enough diverse candidates to proceed?"""
-    n = len(state.candidates)
-    retry_count = state.run_meta.retry_count
-    if n >= _MIN_CANDIDATES_BEFORE_RETRY or retry_count >= state.run_meta.max_retries:
-        logger.info("R1: %d candidates, proceeding to source_auditor", n)
-        return "source_auditor"
-    logger.info("R1: only %d candidates, triggering retry round", n)
-    return "retry_scout"
+def _expand_blocked(state) -> bool:
+    """Expansion only while elapsed <150 s and ≥60 s of discovery budget left."""
+    try:
+        from scholarship_finder.engine import context as rc
+        ctx = rc.current()
+        if ctx is None:
+            return False
+        return ctx.elapsed() >= 150 or ctx.discovery_time_left() <= 60
+    except Exception:
+        return False
 
 
-def _r2_has_opportunities(state: SwarmState) -> str:
-    """R2: Did the auditor find enough verified opportunities?"""
-    n = len(state.opportunities)
-    if n >= _MIN_OPPORTUNITIES:
-        return "ranking_strategist"
-    logger.warning("R2: %d opportunities — insufficient; marking DEGRADED", n)
-    return "degraded_end"
+def _after_auditor(state: "SwarmState | dict", target: int) -> str:
+    """After auditing: expand leads once, rank, or go straight to advice."""
+    if isinstance(state, dict):
+        state = SwarmState.model_validate(state)
+    verified = state.existence_verified_count()
+    if (
+        verified < target
+        and state.run_meta.expansion_rounds == 0
+        and (state.leads or state.candidates)
+        and run_context.time_left() > 75
+    ):
+        return ["lead_expansion"]
+    if verified >= 1:
+        return ["ranking_strategist"]
+    # Both nodes must fire so the finalize join (multi-source edge) completes;
+    # application_strategist no-ops when there is no top-5.
+    return ["gap_advisor", "application_strategist"]
 
 
-def _r3_sop_needed(state: SwarmState) -> str:
-    """R3: Should we generate a SOP (Phase B)?"""
-    if state.top_5 and state.profile:
-        return "application_strategist"
-    return "complete_end"
 
-
-# ── Node wrappers ─────────────────────────────────────────────────────────────
+# ── Graph factory ─────────────────────────────────────────────────────────────
 
 def make_graph(
     *,
-    profile_enricher_agent,
-    opportunity_scout_agent,
-    source_auditor_agent,
-    ranking_strategist_agent,
-    application_strategist_agent,
-    bus: EventBus,
-    scrubbed_text: str,
+    profile_enricher_agent: Any = None,
+    opportunity_scout_agent: Any = None,
+    source_auditor_agent: Any = None,
+    ranking_strategist_agent: Any = None,
+    gap_advisor_agent: Any = None,
+    application_strategist_agent: Any = None,
+    bus: EventBus | None = None,
+    scrubbed_text: str | None = None,
     github_username: str | None = None,
-    vault=None,
+    vault: Any = None,
     is_replay: bool = False,
-    force_refresh: bool = False,
-) -> Callable[[SwarmState], Any]:
-    """Build and compile the LangGraph StateGraph. Returns a runnable coroutine factory."""
+    target_verified: int = 10,
+    **_ignored: Any,
+) -> Callable[[SwarmState, EventBus], AsyncIterator[SwarmState]]:
+    """Build and compile the StateGraph. Returns a per-run stream factory."""
 
-    async def node_profile_enricher(state: SwarmState) -> SwarmState:
-        state = _advance_phase(state, RunPhase.PHASE_A)
-        return await profile_enricher_agent.run(
-            state, bus,
-            scrubbed_text=scrubbed_text,
-            github_username=github_username,
-        )
+    def _wrap(name: str, agent: Any, call: Callable | None = None,
+              phase: RunPhase | None = None):
+        """Wrap an agent call into a LangGraph node returning a dict update."""
+        async def node(state: SwarmState) -> dict[str, Any]:
+            run_context.emit(name, f"{name} started", kind=EventKind.NODE_STARTED)
+            try:
+                if agent is None or call is None:
+                    result = None
+                else:
+                    result = await call(state)
+            except Exception as exc:
+                logger.exception("Graph: node %s failed — run continues degraded", name)
+                run_context.emit(
+                    name, f"{name} failed: {exc}",
+                    kind=EventKind.WARNING, severity=EventSeverity.WARNING,
+                )
+                result = None
+            update = _to_update(result)
+            if phase is not None:
+                update = _advance_phase(update, state, phase)
+            run_context.emit(name, f"{name} finished", kind=EventKind.NODE_COMPLETED)
+            return update
+        return node
 
-    async def node_opportunity_scout(state: SwarmState) -> SwarmState:
-        return await opportunity_scout_agent.run(state, bus)
+    async def node_lead_expansion(state: SwarmState) -> dict[str, Any]:
+        """One expansion round over auditor-found leads (marks expansion_rounds)."""
+        update: dict[str, Any] = {}
+        expand = getattr(opportunity_scout_agent, "expand", None)
+        if expand is not None:
+            try:
+                update = _to_update(await expand(state))
+            except Exception as exc:
+                logger.exception("Graph: lead_expansion failed")
+                run_context.emit(
+                    "lead_expansion", f"Lead expansion failed: {exc}",
+                    kind=EventKind.WARNING, severity=EventSeverity.WARNING,
+                )
+        meta = state.run_meta.model_copy(update={"expansion_rounds": 1})
+        update["run_meta"] = meta
+        return update
 
-    async def node_retry_scout(state: SwarmState) -> SwarmState:
-        """Increment retry counter and re-run the scout."""
-        new_meta = state.run_meta.model_copy(
-            update={"retry_count": state.run_meta.retry_count + 1}
-        )
-        state = state.model_copy(update={"run_meta": new_meta})
-        await bus.publish(Event(
-            run_id=state.run_meta.run_id,
-            seq=0,
-            timestamp=datetime.now(timezone.utc),
-            node="retry_scout",
-            severity=EventSeverity.WARNING,
-            kind=EventKind.RETRY_TRIGGERED,
-            payload={"retry_count": state.run_meta.retry_count},
-        ))
-        return await opportunity_scout_agent.run(state, bus)
-
-    async def node_source_auditor(state: SwarmState) -> SwarmState:
-        return await source_auditor_agent.run(state, bus)
-
-    async def node_ranking_strategist(state: SwarmState) -> SwarmState:
-        updated = await ranking_strategist_agent.run(state, bus)
-        # Emit PHASE_A_READY after ranking completes
-        await bus.publish(Event(
-            run_id=updated.run_meta.run_id,
-            seq=0,
-            timestamp=datetime.now(timezone.utc),
-            node="ranking_strategist",
-            severity=EventSeverity.INFO,
-            kind=EventKind.PHASE_A_READY,
-            payload={
-                "top_5": updated.top_5,
-                "opportunity_count": len(updated.opportunities),
-            },
-        ))
-        return updated
-
-    async def node_application_strategist(state: SwarmState) -> SwarmState:
-        return await application_strategist_agent.run(state, bus, vault=vault)
-
-    async def node_degraded_end(state: SwarmState) -> SwarmState:
-        """Emit terminal degraded event and mark state."""
-        await bus.publish(Event(
-            run_id=state.run_meta.run_id,
-            seq=0,
-            timestamp=datetime.now(timezone.utc),
-            node="graph",
-            severity=EventSeverity.WARNING,
-            kind=EventKind.RUN_DEGRADED,
-            payload={"reason": "insufficient_opportunities", "outcome": RunOutcome.PARTIAL.value},
-        ))
-        new_meta = state.run_meta.model_copy(update={"outcome": RunOutcome.PARTIAL})
-        return state.model_copy(update={"run_meta": new_meta})
-
-    async def node_complete_end(state: SwarmState) -> SwarmState:
-        """Emit RUN_COMPLETED terminal event."""
-        outcome = RunOutcome.COMPLETE if state.application_package else RunOutcome.PARTIAL
-        await bus.publish(Event(
-            run_id=state.run_meta.run_id,
-            seq=0,
-            timestamp=datetime.now(timezone.utc),
-            node="graph",
-            severity=EventSeverity.INFO,
-            kind=EventKind.RUN_COMPLETED,
-            payload={
-                "outcome": outcome.value,
-                "top_5": state.top_5,
-                "has_sop": state.application_package is not None,
-            },
-        ))
-        new_meta = state.run_meta.model_copy(
+    async def node_finalize(state: SwarmState) -> dict[str, Any]:
+        """Terminal node: outcome COMPLETE when top-5 + SOP, else DEGRADED."""
+        pkg = state.applications.get(state.top_5[0]) if state.top_5 else None
+        sop_ready = pkg is not None and pkg.status == "ready"
+        outcome = RunOutcome.COMPLETE if (state.top_5 and sop_ready) else RunOutcome.DEGRADED
+        meta = state.run_meta.model_copy(
             update={"outcome": outcome, "phase": RunPhase.COMPLETED}
         )
-        return state.model_copy(update={"run_meta": new_meta})
+        run_context.emit(
+            "finalize",
+            "Run completed" if outcome == RunOutcome.COMPLETE
+            else "Run finished with partial results",
+            kind=(EventKind.RUN_COMPLETED if outcome == RunOutcome.COMPLETE
+                  else EventKind.RUN_DEGRADED),
+            severity=(EventSeverity.INFO if outcome == RunOutcome.COMPLETE
+                      else EventSeverity.WARNING),
+            outcome=outcome.value,
+            top_5=list(state.top_5),
+        )
+        try:
+            from scholarship_finder.engine import context as _rc
+            c = _rc.current()
+            if c is not None:
+                run_context.emit("llm_router",
+                                 f"LLM usage: {c.llm_usage_summary()}")
+        except Exception:
+            pass
+        return {"run_meta": meta}
 
-    # ── Build StateGraph ──────────────────────────────────────────────────────
     builder = StateGraph(SwarmState)
 
-    builder.add_node("profile_enricher", node_profile_enricher)
-    builder.add_node("opportunity_scout", node_opportunity_scout)
-    builder.add_node("retry_scout", node_retry_scout)
-    builder.add_node("source_auditor", node_source_auditor)
-    builder.add_node("ranking_strategist", node_ranking_strategist)
+    builder.add_node("profile_enricher", _wrap(
+        "profile_enricher", profile_enricher_agent,
+        (lambda s: profile_enricher_agent.run(
+            s, bus, scrubbed_text=scrubbed_text or "",
+            github_username=github_username,
+        )) if profile_enricher_agent is not None else None,
+        phase=RunPhase.PHASE_A,
+    ))
+    builder.add_node("opportunity_scout", _wrap(
+        "opportunity_scout", opportunity_scout_agent,
+        (lambda s: opportunity_scout_agent.run(
+            s, bus, scrubbed_text=scrubbed_text,
+        )) if opportunity_scout_agent is not None else None,
+    ))
+    builder.add_node("source_auditor", _wrap(
+        "source_auditor", source_auditor_agent,
+        (lambda s: source_auditor_agent.run(s, bus))
+        if source_auditor_agent is not None else None,
+    ))
+    builder.add_node("lead_expansion", node_lead_expansion)
+    builder.add_node("ranking_strategist", _wrap(
+        "ranking_strategist", ranking_strategist_agent,
+        (lambda s: ranking_strategist_agent.run(s, bus))
+        if ranking_strategist_agent is not None else None,
+        phase=RunPhase.PHASE_B,
+    ))
+    builder.add_node("gap_advisor", _wrap(
+        "gap_advisor", gap_advisor_agent,
+        (lambda s: gap_advisor_agent.run(s, bus))
+        if gap_advisor_agent is not None else None,
+    ))
+    async def node_application_strategist(state: SwarmState) -> dict[str, Any]:
+        """SOP branch — a no-op when no top-5 exists (the finalize join
+        still needs this node to fire)."""
+        if not state.top_5:
+            return {}
+        return await _wrap(
+            "application_strategist", application_strategist_agent,
+            (lambda s: application_strategist_agent.run(s, bus, vault=vault))
+            if application_strategist_agent is not None else None,
+        )(state)
+
     builder.add_node("application_strategist", node_application_strategist)
-    builder.add_node("degraded_end", node_degraded_end)
-    builder.add_node("complete_end", node_complete_end)
+    builder.add_node("finalize", node_finalize)
 
-    # Entry point
     builder.set_entry_point("profile_enricher")
-
-    # Linear edges
     builder.add_edge("profile_enricher", "opportunity_scout")
-
-    # R1: enough candidates? Retry scout once, then audit pages in waves
-    # (wave fetch follows listing-page links; per-URL mappers dropped those pages).
-    builder.add_conditional_edges(
-        "opportunity_scout",
-        _r1_enough_candidates,
-        {"source_auditor": "source_auditor", "retry_scout": "retry_scout"},
-    )
-    builder.add_edge("retry_scout", "source_auditor")
-
-    # R2: has opportunities?
+    builder.add_edge("opportunity_scout", "source_auditor")
     builder.add_conditional_edges(
         "source_auditor",
-        _r2_has_opportunities,
-        {"ranking_strategist": "ranking_strategist", "degraded_end": "degraded_end"},
+        lambda state: _after_auditor(state, target_verified),
+        ["lead_expansion", "ranking_strategist", "gap_advisor", "application_strategist"],
     )
-
-    # R3: SOP needed?
-    builder.add_conditional_edges(
-        "ranking_strategist",
-        _r3_sop_needed,
-        {"application_strategist": "application_strategist", "complete_end": "complete_end"},
-    )
-
-    builder.add_edge("application_strategist", "complete_end")
-    builder.add_edge("degraded_end", END)
-    builder.add_edge("complete_end", END)
+    builder.add_edge("lead_expansion", "source_auditor")
+    builder.add_edge("ranking_strategist", "gap_advisor")
+    builder.add_edge("ranking_strategist", "application_strategist")
+    builder.add_edge(["gap_advisor", "application_strategist"], "finalize")
+    builder.add_edge("finalize", END)
 
     graph = builder.compile()
 
-    async def run_graph(initial_state: SwarmState, event_bus: EventBus, **kwargs) -> SwarmState:
-        """Execute the compiled graph from initial_state.
-
-        Config includes conservative max_concurrency for rate limit protection (Phase 2.1).
-        """
-        # Conservative concurrency limit for Send API (Phase 2.1)
+    async def run_graph(initial_state: SwarmState, event_bus: EventBus, **_kw: Any) -> AsyncIterator[SwarmState]:
+        """Stream SwarmState values after every super-step (stream_mode='values')."""
         config = {"configurable": {"max_concurrency": 6}}
+        async for values in graph.astream(initial_state, config=config, stream_mode="values"):
+            yield SwarmState.model_validate(values)
 
-        result = await graph.ainvoke(initial_state, config=config)  # type: ignore[arg-type]
-        # LangGraph returns a dict when nodes return Pydantic models; reconstruct
-        if isinstance(result, dict):
-            return SwarmState(**result)
-        return result
-
-    return run_graph  # type: ignore[return-value]
-
-
-def _advance_phase(state: SwarmState, phase: RunPhase) -> SwarmState:
-    """Move run_meta.phase forward (monotonic)."""
-    new_meta = state.run_meta.model_copy(update={"phase": phase})
-    return state.model_copy(update={"run_meta": new_meta})
+    return run_graph

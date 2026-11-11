@@ -1,7 +1,6 @@
 """Tests for data-driven enrichment tip generation."""
 from __future__ import annotations
 
-import pytest
 
 from scholarship_finder.domain.enrichment_tips import (
     EnrichmentTip,

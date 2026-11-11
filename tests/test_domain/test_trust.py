@@ -1,7 +1,6 @@
 """Tests for domain trust classification."""
 from __future__ import annotations
 
-import pytest
 
 from scholarship_finder.domain.models import TrustTier
 from scholarship_finder.domain.trust import classify_domain, is_top_5_eligible
@@ -58,7 +57,15 @@ class TestClassifyDomain:
 
     # Unknown
     def test_random_blog(self):
-        assert classify_domain("myrandomscholarshipblog.com") == TrustTier.UNKNOWN
+        # Look-alike scholarship vocabulary + no official TLD → aggregator.
+        assert classify_domain("myrandomscholarshipblog.com") == TrustTier.AGGREGATOR
+
+    def test_lookalike_table(self):
+        # Official/funder signals stay official or recognized…
+        assert classify_domain("daad.de") != TrustTier.AGGREGATOR
+        # …but look-alikes and aggregator domains are caught.
+        assert classify_domain("daadscholarship.com") == TrustTier.AGGREGATOR
+        assert classify_domain("studyabroadportal.com") == TrustTier.AGGREGATOR
 
     # www prefix stripping
     def test_www_stripped(self):

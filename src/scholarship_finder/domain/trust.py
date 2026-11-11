@@ -51,7 +51,6 @@ _FUNDER_DOMAINS: frozenset[str] = frozenset({
     "erasmusplus.eu",
     "eacea.ec.europa.eu",
     "studyineurope.eu",
-    "scholars4dev.com",
     "research.gov",           # NSF
     "nserc-crsng.gc.ca",      # NSERC Canada
     "sshrc-crsh.gc.ca",       # SSHRC Canada
@@ -76,6 +75,10 @@ _FUNDER_DOMAINS: frozenset[str] = frozenset({
 
 # Known aggregator domains (leads only; not Top-5 eligible by themselves)
 _AGGREGATOR_DOMAINS: frozenset[str] = frozenset({
+    "scholars4dev.com", "scholarwing.com", "brilliantqatar.com", "gostudyoverseas.in",
+    "gyanone.com", "scholarconnect.asia", "cicnews.com", "yocket.com", "shiksha.com",
+    "leverageedu.com", "collegedunia.com", "careers360.com", "edvoy.com", "ischolarship.org",
+    "scholarshipportal.com", "internationalscholarships.com", "studyin-uk.com",
     "scholarships.com",
     "scholarship-positions.com",
     "mastersportal.eu",
@@ -155,6 +158,15 @@ def classify_domain(domain: str) -> TrustTier:
 
     # Aggregator check first (highest false-positive risk)
     if d in _AGGREGATOR_DOMAINS:
+        return TrustTier.AGGREGATOR
+    # Look-alike/aggregator heuristic: scholarship-portal vocabulary in the
+    # domain with no official TLD signal (yocket, daadscholarship.com style).
+    _OFFICIAL_TLD = (".edu", ".ac.", ".gov", ".gc.ca", ".edu.au", ".ac.uk",
+                     ".gov.uk", ".gov.au", ".edu.sg", ".gov.sg", ".de",
+                     ".nic.in", ".gov.in", ".eu.int", ".un.org", ".int")
+    if not any(t in d for t in _OFFICIAL_TLD) and re.search(
+            r"scholarship|studyabroad|study-portal|studyportal|studylink|"
+            r"educations?|admissions?|applynow|find-?courses?|courses?-?finder", d):
         return TrustTier.AGGREGATOR
 
     # Recognised funder

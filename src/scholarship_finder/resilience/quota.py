@@ -1,186 +1,116 @@
-"""Token-bucket Quota Governor — rate-limit smoothing and budget enforcement.
+"""Per-model rate limiting: requests/min, tokens/min and requests/day.
 
-Manages two dimensions per (provider, model):
-  - RPM (requests per minute) — smoothed via a token bucket
-  - RPD (requests per day)    — hard daily ceiling
-
-Also tracks per-run reasoning-tier call budget (architecture invariant DEC-1: ≤4).
-
-Architecture reference: §3.2, §3.7.
+The LLM router asks the limiter how long it would have to wait before a call of
+an estimated size fits a model's budget, and picks the model with the shortest
+wait. Live rate-limit headers (Groq ``x-ratelimit-remaining-tokens``) correct the
+local estimate so we never hammer a model that is already saturated.
 """
 from __future__ import annotations
 
-import asyncio
+import threading
 import time
-from dataclasses import dataclass
-
-from scholarship_finder.errors import QuotaExhaustedError, RateLimitedError, RateLimitScope
-
-
-@dataclass
-class QuotaProfile:
-    """Per-(provider, model) quota limits."""
-    provider: str
-    model: str
-    rpm: int = 15          # requests per minute
-    rpd: int = 500         # requests per day
-    tpm: int = 1_000_000   # tokens per minute (informational; not enforced yet)
-    # Pool: "public" consumes public quota; "judge" consumes from the reserve
-    pool: str = "public"
+from dataclasses import dataclass, field
 
 
 class TokenBucket:
-    """Leaky-bucket rate limiter for RPM smoothing.
-
-    Fills at rate `rpm / 60` tokens per second up to capacity `rpm`.
-    A request consumes one token; if empty, returns the wait time in seconds.
-    """
+    """Continuous-refill bucket: ``per_minute`` units per minute, burst = ``per_minute``."""
 
     def __init__(self, rpm: int) -> None:
-        self.capacity = max(1, rpm)
-        self.tokens: float = float(self.capacity)
-        self.refill_rate: float = rpm / 60.0     # tokens per second
+        self.capacity = float(max(1, rpm))
+        self.tokens: float = self.capacity
+        self.refill_rate: float = self.capacity / 60.0     # units per second
         self._last_refill: float = time.monotonic()
 
     def _refill(self) -> None:
         now = time.monotonic()
-        elapsed = now - self._last_refill
-        self.tokens = min(self.capacity, self.tokens + elapsed * self.refill_rate)
+        self.tokens = min(self.capacity, self.tokens + (now - self._last_refill) * self.refill_rate)
         self._last_refill = now
 
-    def acquire(self) -> float:
-        """Attempt to consume one token.
-
-        Returns:
-            0.0 if a token was available (proceed immediately).
-            >0.0 seconds to wait before the token will be available.
-        """
+    def wait_time(self, amount: float = 1.0) -> float:
+        """Seconds until ``amount`` units are available (0 if available now)."""
         self._refill()
-        if self.tokens >= 1.0:
-            self.tokens -= 1.0
+        amount = min(amount, self.capacity)
+        if self.tokens >= amount:
             return 0.0
-        # Time until next token is available
-        return (1.0 - self.tokens) / self.refill_rate
+        return (amount - self.tokens) / self.refill_rate
+
+    def acquire(self, amount: float = 1.0) -> float:
+        """Consume ``amount`` if available and return 0.0; otherwise return the wait time."""
+        wait = self.wait_time(amount)
+        if wait == 0.0:
+            self.tokens -= min(amount, self.capacity)
+        return wait
+
+    def force_consume(self, amount: float) -> None:
+        """Consume even if it drives the bucket negative (used after an actual call)."""
+        self._refill()
+        self.tokens -= amount
+
+    def set_available(self, amount: float) -> None:
+        """Clamp the local estimate to a server-reported remaining value."""
+        self._refill()
+        self.tokens = min(self.tokens, float(amount))
 
 
-class QuotaGovernor:
-    """Per-run and per-provider quota tracker.
+@dataclass
+class _ModelState:
+    requests: TokenBucket
+    tokens: TokenBucket
+    rpd: int
+    day_used: int = 0
+    day_started: float = field(default_factory=time.monotonic)
 
-    Responsibilities:
-    - RPM smoothing via token buckets (wait ≤8 s; else signal fail-over)
-    - RPD hard ceiling (raise QuotaExhaustedError when hit)
-    - Per-run reasoning-tier call cap (DEC-1: ≤4)
-    - Judge reserve: hold back `reserve_ratio` of RPD for judge pool
-    """
 
-    def __init__(
-        self,
-        profiles: list[QuotaProfile],
-        reserve_ratio: float = 0.30,
-        max_reasoning_per_run: int = 4,
-        is_judge: bool = False,
-    ) -> None:
-        self._profiles: dict[str, QuotaProfile] = {
-            f"{p.provider}/{p.model}": p for p in profiles
-        }
-        self._buckets: dict[str, TokenBucket] = {}
-        self._daily_used: dict[str, int] = {}
-        self._reserve_ratio = reserve_ratio
-        self._max_reasoning = max_reasoning_per_run
-        self._reasoning_used = 0
-        self._is_judge = is_judge
+class ModelLimiter:
+    """Thread-safe per-model RPM / TPM / RPD bookkeeping."""
 
-    def _key(self, provider: str, model: str) -> str:
-        return f"{provider}/{model}"
+    def __init__(self) -> None:
+        self._models: dict[str, _ModelState] = {}
+        self._lock = threading.Lock()
 
-    def _bucket(self, key: str) -> TokenBucket:
-        if key not in self._buckets:
-            profile = self._profiles.get(key)
-            rpm = profile.rpm if profile else 10
-            self._buckets[key] = TokenBucket(rpm)
-        return self._buckets[key]
+    def configure(self, model: str, rpm: int, tpm: int, rpd: int) -> None:
+        with self._lock:
+            if model not in self._models:
+                self._models[model] = _ModelState(TokenBucket(rpm), TokenBucket(tpm), rpd)
 
-    def _effective_rpd(self, profile: QuotaProfile) -> int:
-        """RPD available to this session after reserving the judge pool."""
-        if self._is_judge:
-            return profile.rpd  # judge gets full quota
-        return int(profile.rpd * (1.0 - self._reserve_ratio))
+    def _state(self, model: str) -> _ModelState:
+        if model not in self._models:
+            self._models[model] = _ModelState(TokenBucket(60), TokenBucket(200_000), 10_000)
+        st = self._models[model]
+        if time.monotonic() - st.day_started > 86_400:
+            st.day_used, st.day_started = 0, time.monotonic()
+        return st
 
-    async def acquire(
-        self,
-        provider: str,
-        model: str,
-        tier: str = "fast",
-        max_wait_s: float = 8.0,
-    ) -> None:
-        """Block until a quota slot is available, or raise if limits are exceeded.
+    def wait_time(self, model: str, est_tokens: int) -> float:
+        """Seconds to wait before a call of ``est_tokens`` fits; ``inf`` if RPD exhausted."""
+        with self._lock:
+            st = self._state(model)
+            if st.day_used >= st.rpd:
+                return float("inf")
+            return max(st.requests.wait_time(1), st.tokens.wait_time(est_tokens))
 
-        Args:
-            provider:   Adapter provider name e.g. "gemini".
-            model:      Model ID.
-            tier:       "reasoning" | "fast" | "vision".
-            max_wait_s: If the token-bucket wait exceeds this, raise RateLimitedError
-                        (caller will fail over to next chain entry).
+    def reserve(self, model: str, est_tokens: int) -> None:
+        """Debit one request and the estimated tokens (call right before sending)."""
+        with self._lock:
+            st = self._state(model)
+            st.requests.force_consume(1)
+            st.tokens.force_consume(min(est_tokens, st.tokens.capacity))
+            st.day_used += 1
 
-        Raises:
-            QuotaExhaustedError: Daily RPD reached.
-            RateLimitedError:    RPM wait > max_wait_s.
-        """
-        key = self._key(provider, model)
+    def observe_remaining(self, model: str, remaining_tokens: int | None) -> None:
+        """Feed server-reported remaining tokens back into the local estimate."""
+        if remaining_tokens is None:
+            return
+        with self._lock:
+            self._state(model).tokens.set_available(remaining_tokens)
 
-        # ── DEC-1: reasoning cap ──────────────────────────────────────────
-        if tier == "reasoning":
-            if self._reasoning_used >= self._max_reasoning:
-                raise QuotaExhaustedError(
-                    provider,
-                    f"Reasoning-tier cap reached: {self._reasoning_used}/{self._max_reasoning} "
-                    "per-run calls used. Downshifting to fast tier.",
-                )
+    def penalize(self, model: str, seconds: float) -> None:
+        """After a 429, drain the token bucket so it refills in ``seconds``."""
+        with self._lock:
+            st = self._state(model)
+            st.tokens.force_consume(st.tokens.tokens + st.tokens.refill_rate * max(seconds, 1.0))
 
-        # ── RPD hard ceiling ──────────────────────────────────────────────
-        profile = self._profiles.get(key)
-        if profile:
-            used = self._daily_used.get(key, 0)
-            limit = self._effective_rpd(profile)
-            if used >= limit:
-                raise QuotaExhaustedError(
-                    provider,
-                    f"Daily quota exhausted for {model}: {used}/{limit} requests used.",
-                )
-
-        # ── RPM token bucket ──────────────────────────────────────────────
-        wait = self._bucket(key).acquire()
-        if wait > max_wait_s:
-            raise RateLimitedError(
-                provider,
-                f"Rate limit wait {wait:.1f}s exceeds max_wait {max_wait_s}s for {model}",
-                scope=RateLimitScope.MINUTE,
-                retry_after=wait,
-            )
-        if wait > 0.0:
-            await asyncio.sleep(wait)
-
-        # ── Commit ────────────────────────────────────────────────────────
-        self._daily_used[key] = self._daily_used.get(key, 0) + 1
-        if tier == "reasoning":
-            self._reasoning_used += 1
-
-    def reasoning_used(self) -> int:
-        return self._reasoning_used
-
-    def daily_usage(self) -> dict[str, int]:
-        return dict(self._daily_used)
-
-    def quota_summary(self) -> dict[str, dict]:
-        """For telemetry / pre-flight canary reporting."""
-        summary: dict[str, dict] = {}
-        for key, profile in self._profiles.items():
-            used = self._daily_used.get(key, 0)
-            limit = self._effective_rpd(profile)
-            summary[key] = {
-                "used": used,
-                "limit": limit,
-                "remaining": max(0, limit - used),
-                "pct_used": round(used / limit * 100, 1) if limit else 0,
-            }
-        return summary
+    def mark_day_exhausted(self, model: str) -> None:
+        with self._lock:
+            st = self._state(model)
+            st.day_used = st.rpd

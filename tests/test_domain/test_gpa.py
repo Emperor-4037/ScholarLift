@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from scholarship_finder.domain.gpa import normalize_gpa, GPAResult
+from scholarship_finder.domain.gpa import normalize_gpa
 
 
 class TestBavarianFormula:
@@ -87,3 +87,24 @@ class TestValidation:
     def test_unknown_target_falls_back_to_passthrough(self):
         result = normalize_gpa(3.5, 4.0, target="nonexistent_target")
         assert result.method == "passthrough"
+
+
+# ── generic linear rescale (fix E) ───────────────────────────────────────────
+
+def test_five_point_scale_rescales():
+    from scholarship_finder.domain.gpa import normalize_gpa
+    r = normalize_gpa(4.1, 5.0)
+    assert abs(r.value - 3.28) < 0.01
+    assert r.method == "linear_rescale"
+
+
+def test_twenty_point_scale_rescales():
+    from scholarship_finder.domain.gpa import normalize_gpa
+    r = normalize_gpa(15.0, 20.0)
+    assert abs(r.value - 3.0) < 0.01
+
+
+def test_four_point_passthrough():
+    from scholarship_finder.domain.gpa import normalize_gpa
+    r = normalize_gpa(3.6, 4.0)
+    assert r.value == 3.6 and r.method == "passthrough"

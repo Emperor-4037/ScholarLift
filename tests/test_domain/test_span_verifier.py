@@ -1,7 +1,6 @@
 """Tests for the evidence-span verifier."""
 from __future__ import annotations
 
-import pytest
 
 from scholarship_finder.domain.span_verifier import normalize_text, verify_span
 

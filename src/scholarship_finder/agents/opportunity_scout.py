@@ -1,663 +1,501 @@
-"""Agent 2: Opportunity Scout
+"""Agent 2: Opportunity Scout — profile-driven search planning + execution.
 
-Responsibilities (architecture §1.3, Agent 2):
-- Use LLM (fast tier) to generate a disciplined SearchPlan: 3–5 queries
-  spanning programs, scholarships, funders — discipline-agnostic, country/level targeted
-- Execute searches via SearchPort (Tavily primary, secondary fallback)
-- Canonicalize URLs, classify domain trust tiers, deduplicate by canonical_url
-- Return up to ~20 unique Candidate objects for downstream auditing
+One FAST complete_json plans ~8 queries (intent + country). A deterministic
+complement guarantees coverage: ≥1 query per target country (≤4) and ≥2
+nationality-specific queries. Fallback = templates only (discipline-agnostic).
+Candidates get trust tier + prior_score; top ``max_audit_candidates`` returned.
 
-LangGraph routing: after this node, routing predicate R1 checks if
-sufficient diverse candidates exist; if not, triggers a retry round (max 1).
-
-DEC-1: fast tier only for query planning. No reasoning tier calls here.
+``expand(state)``: one round over auditor-discovered leads + broader queries.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
-from datetime import datetime, timezone
+import re
 from typing import Any
+from urllib.parse import urlparse
 
 from scholarship_finder.domain.models import (
     Candidate,
-    Event,
-    EventKind,
-    EventSeverity,
     LLMTier,
-    OpportunityKind,
     SearchPlan,
     SearchQuery,
     SwarmState,
     TrustTier,
 )
-from scholarship_finder.domain.reducers import reduce_candidates, reduce_search_plans
 from scholarship_finder.domain.trust import classify_domain
 from scholarship_finder.domain.url import canonicalize_url, extract_domain
+from scholarship_finder.engine.context import emit
 from scholarship_finder.engine.event_bus import EventBus
 from scholarship_finder.ports.llm import LLMPort, TaskSpec
-from scholarship_finder.ports.search import SearchPort
+from scholarship_finder.ports.search import SearchPort, SearchQuery as PortQuery
 
 logger = logging.getLogger(__name__)
 
-# Maximum URLs to pass forward
-_MAX_CANDIDATES = 20  # Reduced from 30 for token efficiency
+_NUM_LLM_QUERIES = 8
+_MAX_LEADS = 8
+_FUNDING_WORDS = re.compile(
+    r"scholarship|fellowship|stipend|funding|tuition.?waiver|bursar|grant|"
+    r"stipendium|bourse|beca|beurs|fellowship|assistantship",
+    re.I,
+)
+_INDEX_HINT = re.compile(r"(/scholarships/?$|/search|/list|directory|database)", re.I)
 
-# Tavily include_domains requires hostnames, not TLD suffixes like ".edu".
-# Suffix filters return zero hits, which is why scout + auditor produced
-# no verified opportunities. Constrain only funder queries to known bodies.
-_TRUSTED_SCHOLARSHIP_DOMAINS: list[str] = []
+def _ctx():
+    try:
+        from scholarship_finder.engine import context as rc
+        return rc.current()
+    except Exception:
+        return None
 
-_TRUSTED_PROGRAM_DOMAINS: list[str] = []
 
-_TRUSTED_FUNDER_DOMAINS = [
-    "daad.de",
-    "chevening.org",
-    "fulbright.org",
-    "fulbrightscholars.org",
-    "commonwealthscholarships.ac.uk",
-    "erasmusplus.eu",
-    "eacea.ec.europa.eu",
-    "a-star.edu.sg",
-    "moe.gov.sg",
-    "nserc-crsng.gc.ca",
-    "sshrc-crsh.gc.ca",
-    "humboldt-foundation.de",
-    "studienstiftung.de",
-    "csc.edu.cn",
-    "mastercardfdn.org",
-]
+_STOP_TOKENS = frozenset({
+    "the","a","an","of","for","in","and","to","scholarship","scholarships",
+    "award","awards","program","programme","fund","fellowship","grant",
+    "international","students","student","fully","funded","masters","phd"})
 
-# Domains to exclude from search results (aggregators and listing sites)
-_EXCLUDE_DOMAINS = [
-    "scholarships.com",
-    "fastweb.com",
-    "bigfuture.collegeboard.org",
-    "scholarshipamerica.org",
-    "onlinemastersdegrees.com",
-    "studyportals.com",
-    "mastersportal.eu",
-    "phdportal.eu",
-    "findamasters.com",
-    "findaphd.com",
-    "opportunitydesk.org",
-    "youthop.com",
-    "scholarship-positions.com",
-    "afterschoolafrica.com",
-    "opportunitiesforafricans.com",
-    "scholars.co",
-    "studyabroad.com",
-    "idp.com",
-    "studylink.com",
-    "niche.com",
-    "cappex.com",
-    "unigo.com",
-    "chegg.com",
-    "scholarshipowl.com",
-    "scholarships360.org",
-    "scholarshiptab.com",
-]
 
-# Feature toggle for query variants (disabled by default to control API costs)
-_ENABLE_QUERY_VARIANTS = False
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", " ", s.lower())).strip()
 
-_QUERY_PLAN_PROMPT = """\
-You are an expert search strategist specializing in funding opportunities. Given a candidate's academic profile (below), \
-generate a precise JSON search plan to find graduate opportunities WITH FUNDING using query expansion techniques.
 
-Return ONLY valid JSON (no markdown):
-{{
-  "queries": [
-    {{
-      "text": "<specific search query string, max 400 characters>",
-      "intent": "<one of: program | scholarship | funder>",
-      "country": "<country name or null>",
-      "depth": "<basic or advanced>",
-      "reasoning": "<brief explanation of why this query will find funding opportunities>"
-    }},
-    ...
-  ]
-}}
+def q_text(name: str, d: dict) -> str:
+    return f'"{name}" {d.get("provider") or ""} scholarship'.strip()
 
-Query Construction Rules:
-- Generate exactly {num_queries} queries.
-- Cover at least 2 distinct intents (program, scholarship, funder).
-- CRITICAL: For scholarship intent, ALWAYS include funding keywords: "fully funded", "financial aid", "stipend", "tuition waiver", "grant", "fellowship"
-- For program intent, include "with funding", "scholarship", "assistantship", or "fellowship" to ensure funding availability
-- For funder intent, target organizations: "foundation", "endowment", "grant", "funding organization"
-- Use synonyms to increase recall (e.g., "scholarship OR grant OR fellowship")
-- Include degree level, field, and country for specificity
-- Use quotes for exact phrases when appropriate (e.g., "fully funded" OR "tuition waiver")
-- Do NOT use candidate names or personal information.
-- Do NOT generate duplicate-intent, duplicate-country pairs.
-- depth should be "advanced" for scholarship/funder queries (more results needed).
-- Keep each query under 400 characters for API compatibility.
-- Focus on FINDING OPPORTUNITIES WITH ACTUAL FUNDING, not just general admissions.
 
-Query Expansion Strategy:
-- Mix broad and specific queries to capture both popular and niche opportunities
-- Include both direct funding terms and institutional funding language
-- Use OR operators for synonyms when space permits
-- Consider alternative field names and broader category terms
 
-Candidate summary:
-- Degree level sought: {degree_level}
-- Fields of interest: {fields}
-- Target countries: {countries}
-- Funding required: {funding_required}
-- Skills: {skills}
-"""
+
+_TLD_HINTS: dict[str, list[str]] = {
+    "canada": ["*.gc.ca", "*.ca"], "germany": ["*.de"],
+    "singapore": ["*.sg"], "uk": ["*.ac.uk", "*.gov.uk"],
+    "united kingdom": ["*.ac.uk", "*.gov.uk"], "australia": ["*.edu.au", "*.gov.au"],
+    "usa": ["*.edu", "*.gov"], "united states": ["*.edu", "*.gov"],
+}
+_TLD_FALLBACK = ["*.edu", "*.gov", "*.org"]
+
+_PROPOSE_PROMPT = """List up to 30 REAL, currently-running named scholarships or funded
+programs for this student, as a JSON array:
+[{{"name": str, "provider": str, "host_country": str,
+"official_domain_hint": "registrable domain you believe is official or empty",
+"degree_level": str, "why": str}}]
+Cover each target country, nationality-specific programs, and home-country
+outbound schemes. ONLY programs you are confident actually exist — never invent.
+Constraints: must accept applicants moving from the student's CURRENT level to
+the TARGET level (e.g. bachelors→masters); do not list doctoral-only or
+undergraduate-only schemes; must be open to the student's nationality or
+international applicants; give the exact degree_level the scheme funds.
+host_country must be one of the student's target countries (or the funder
+must fund study in them). Discipline-agnostic. No commentary, JSON only.
+
+Student: {profile}"""
+
+
+_PLAN_PROMPT = """You plan web searches to find REAL, currently open funded study
+opportunities (scholarships, funded programs, fellowships) for this student:
+{profile}
+
+Return a JSON array of exactly {n} objects: {{"text": "search query",
+"intent": "government_scholarship|university_scholarship|funded_program|field_fellowship|need_based",
+"country": "one target country or empty"}}.
+Rules: concrete queries naming the country + funding type; cover different
+intents and each target country; include 2 queries aimed at the student's
+nationality; no aggregator sites; keep each query under 12 words."""
 
 
 class OpportunityScoutAgent:
-    """Agent 2: Plans searches and scouts scholarship/program candidates."""
-
-    def __init__(
-        self,
-        llm_port: LLMPort,
-        search_port: SearchPort,
-        secondary_search: SearchPort | None = None,
-    ) -> None:
+    def __init__(self, llm_port: LLMPort, search_port: SearchPort,
+                 secondary_search: SearchPort | None = None) -> None:
         self._llm = llm_port
         self._search = search_port
         self._secondary = secondary_search
-        self._force_refresh = False
 
-    async def run(self, state: SwarmState, bus: EventBus) -> SwarmState:
-        """Generate a search plan and scout candidates.
+    # ── main node ────────────────────────────────────────────────────────────
 
-        Returns SwarmState with candidates and search_plans updated.
-        """
-        run_id = state.run_meta.run_id
+    async def run(self, state: SwarmState, bus: EventBus,
+                  scrubbed_text: str | None = None) -> dict:
         profile = state.profile
-        if profile is None:
-            logger.error("OpportunityScout: no profile in state — skipping")
-            return state
+        plan = await self._plan(profile)
+        emit("opportunity_scout",
+             f"Search plan: {len(plan.queries)} queries ({plan.planner})")
 
-        # Check if force_refresh is enabled
-        self._force_refresh = state.force_refresh
-        if self._force_refresh:
-            logger.info("OpportunityScout: force_refresh enabled - using advanced search depth for all queries")
+        plan.queries = (plan.queries
+                        + self._registry_queries(profile)
+                        + self._official_channel_queries(profile))
+        items = await self._execute(plan.queries)
+        proposed = await self._propose(profile, bus)
+        items += await self._resolve(proposed, bus)
+        candidates = self._to_candidates(items)
+        emit("opportunity_scout",
+             f"{len(items)} hits → {len(candidates)} unique candidates",
+             candidates=len(candidates))
 
-        await bus.publish(Event(
-            run_id=run_id,
-            seq=0,
-            timestamp=datetime.now(timezone.utc),
-            node="opportunity_scout",
-            severity=EventSeverity.INFO,
-            kind=EventKind.NODE_STARTED,
-            payload={"node": "opportunity_scout"},
-        ))
+        ranked = sorted(candidates, key=lambda c: -c.prior_score)
+        limit = _max_audit()
+        kept = ranked[:limit]
+        for c in kept:
+            c.audited = False
+        emit("opportunity_scout",
+             f"Top {len(kept)} candidates sent to audit "
+             f"(best domain trust={kept[0].trust_tier.value if kept else '—'})")
+        return {
+            "search_plans": state.search_plans + [plan],
+            "candidates": state.candidates + kept,
+        }
 
-        round_number = len(state.search_plans) + 1
-        num_queries = 5 if round_number == 1 else 3  # fewer on retry
-
-        # ── Step 1: LLM query planning ────────────────────────────────────────
-        plan = await self._plan_queries(profile, run_id, round_number, num_queries)
-        new_state = state.model_copy(deep=True)
-        new_state.search_plans = reduce_search_plans(state.search_plans, plan)
-
-        await bus.publish(Event(
-            run_id=run_id,
-            seq=0,
-            timestamp=datetime.now(timezone.utc),
-            node="opportunity_scout",
-            severity=EventSeverity.INFO,
-            kind=EventKind.PROGRESS,
-            payload={
-                "stage": "queries_planned",
-                "count": len(plan.queries),
-                "round": round_number,
-            },
-        ))
-
-        # ── Step 2: Execute searches in parallel ──────────────────────────────
-        all_candidates = await self._execute_searches(plan, run_id)
-
-        # ── Step 3: Canonicalize + trust classify + dedupe ────────────────────
-        new_candidates = _canonicalize_and_classify(all_candidates)
-
-        # Merge with existing candidates
-        new_state.candidates = reduce_candidates(state.candidates, new_candidates)
-
-        # Phase 2.2: Emit incremental progress for staircase streaming
-        # This allows downstream agents to start processing before all searches complete
-        if len(new_candidates) >= 5:  # Minimum threshold for streaming
-            await bus.publish(Event(
-                run_id=run_id,
-                seq=0,
-                timestamp=datetime.now(timezone.utc),
-                node="opportunity_scout",
-                severity=EventSeverity.INFO,
-                kind=EventKind.PROGRESS,
-                payload={
-                    "stage": "incremental_candidates",
-                    "count": len(new_state.candidates),
-                    "round": round_number,
-                },
-            ))
-
-        await bus.publish(Event(
-            run_id=run_id,
-            seq=0,
-            timestamp=datetime.now(timezone.utc),
-            node="opportunity_scout",
-            severity=EventSeverity.INFO,
-            kind=EventKind.NODE_COMPLETED,
-            payload={
-                "node": "opportunity_scout",
-                "new_candidates": len(new_candidates),
-                "total_candidates": len(new_state.candidates),
-                "round": round_number,
-            },
-        ))
-
-        return new_state
-
-    # ── Private helpers ───────────────────────────────────────────────────────
-
-    async def _plan_queries(
-        self, profile: Any, run_id: str, round_number: int, num_queries: int
-    ) -> SearchPlan:
-        """Ask the LLM to generate a structured search plan."""
-        import json
-        import uuid
-
-        prefs = profile.preferences if profile.preferences else type('obj', (object,), {
-            'target_fields': [],
-            'countries': [],
-            'degree_level': 'masters',
-            'funding_required': True
-        })()
-        fields_str = ", ".join(prefs.target_fields[:5]) if prefs.target_fields else "any field"
-        countries_str = ", ".join(prefs.countries[:5]) if prefs.countries else "any country"
-        skills_str = ", ".join(profile.skills[:10]) if profile.skills else "none listed"
-
-        instruction = _QUERY_PLAN_PROMPT.format(
-            num_queries=num_queries,
-            degree_level=prefs.degree_level or "masters",
-            fields=fields_str,
-            countries=countries_str,
-            funding_required=prefs.funding_required,
-            skills=skills_str,
-        )
-
-        task = TaskSpec(
-            tier=LLMTier.FAST,
-            instruction=instruction,
-            data_blocks=[],
-            output_schema=None,
-            max_output_tokens=1024,
-        )
-
-        result = await self._llm.complete(task)
-        raw = result.content.strip()
-
-        # Strip code fences
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-
-        try:
-            data = json.loads(raw)
-            queries_raw = data.get("queries", [])
-        except json.JSONDecodeError as json_err:
-            logger.warning("Query plan JSON parse error: %s — attempting repair", json_err)
-            # Try to repair JSON by extracting just the queries array
-            try:
-                if '[' in raw and ']' in raw:
-                    start = raw.find('[')
-                    end = raw.rfind(']') + 1
-                    raw_array = raw[start:end]
-                    # Try to clean common issues
-                    raw_array = raw_array.replace('\n', ' ').replace('\t', ' ')
-                    queries_raw = json.loads(raw_array)
-                else:
-                    raise ValueError("No JSON array found")
-            except Exception as repair_err:
-                logger.error("JSON repair failed: %s — using fallback queries", repair_err)
-                queries_raw = []
-        except Exception as exc:
-            logger.warning("Query plan parsing error: %s — using fallback queries", exc)
-            queries_raw = []
-
+    async def expand(self, state: SwarmState) -> dict:
+        """One expansion round over uncovered leads (+ broader queries if thin)."""
+        ctx = _ctx()
+        if ctx is not None and (ctx.elapsed() >= 150
+                                or ctx.discovery_time_left() <= 60):
+            emit("opportunity_scout", "Expansion skipped — discovery budget spent")
+            return {"expansion_rounds": 1}
+        covered = {o.name.lower() for o in state.opportunities}
+        leads = [l for l in state.leads if l.name.lower() not in covered][: _MAX_LEADS]
         queries: list[SearchQuery] = []
-        for i, q in enumerate(queries_raw[:num_queries]):
-            try:
-                query_text = str(q.get("text", ""))
-                # Validate query length for Tavily API (max 400 chars)
-                if len(query_text) > 400:
-                    logger.warning("Query %d exceeds 400 chars, truncating: %s", i, query_text[:60])
-                    query_text = query_text[:400]
-                
-                # Log query quality metrics
-                funding_keywords = ["funded", "funding", "scholarship", "grant", "fellowship", 
-                                    "stipend", "tuition waiver", "financial aid", "assistantship"]
-                keyword_count = sum(1 for kw in funding_keywords if kw.lower() in query_text.lower())
-                reasoning = q.get("reasoning", "")
-                
-                logger.info(
-                    "Query %d: intent=%s, country=%s, funding_keywords=%d, length=%d, reasoning=%s",
-                    i, q.get("intent"), q.get("country"), keyword_count, len(query_text), reasoning[:50]
-                )
-                
-                intent = str(q.get("intent", "program"))
-                # Only pin funder queries to known official hosts. Program and
-                # scholarship queries stay unfiltered so Tavily can return .edu /
-                # .ac.uk / .gov.sg pages (suffix include_domains is invalid).
-                include_domains = _get_trusted_domains(intent) if intent == "funder" else []
-
-                # Use advanced depth if force_refresh is enabled
-                depth = "advanced" if self._force_refresh else str(q.get("depth", "basic"))
-
-                queries.append(SearchQuery(
-                    id=str(uuid.uuid4()),
-                    text=query_text,
-                    intent=intent,
-                    country=q.get("country"),
-                    include_domains=include_domains,
-                    exclude_domains=_EXCLUDE_DOMAINS,  # Exclude aggregators from all queries
-                    depth=depth,
-                    round_number=round_number,
-                ))
-            except Exception as exc:
-                logger.debug("Malformed query at index %d: %s", i, exc)
-
-        # Fallback if LLM returned nothing useful
-        if not queries:
-            queries = _fallback_queries(profile, round_number)
-
-        return SearchPlan(queries=queries, round_number=round_number)
-
-    async def _execute_searches(
-        self, plan: SearchPlan, run_id: str
-    ) -> list[dict[str, Any]]:
-        """Execute all queries concurrently; merge results.
-        
-        If query variants are enabled, generates and executes variants for each query
-        to improve recall through diverse search strategies.
-        """
-        import asyncio
-
-        # Generate query variants if enabled
-        if _ENABLE_QUERY_VARIANTS:
-            logger.info("Query variants enabled - generating expanded search set")
-            all_queries: list[SearchQuery] = []
-            for q in plan.queries:
-                variants = _generate_query_variants(q)
-                all_queries.extend(variants)
-            logger.info("Generated %d total queries from %d base queries", len(all_queries), len(plan.queries))
-        else:
-            all_queries = plan.queries
-
-        tasks = [self._search_one(q) for q in all_queries]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        all_items: list[dict[str, Any]] = []
-        for q, result in zip(all_queries, results):
-            if isinstance(result, Exception):
-                logger.warning("Search failed for query %r: %s", q.text[:60], result)
-                # Try secondary if available
-                if self._secondary:
-                    try:
-                        secondary_result = await self._search_one(q, port=self._secondary)
-                        all_items.extend(secondary_result)
-                    except Exception as exc2:
-                        logger.warning("Secondary search also failed: %s", exc2)
-            elif isinstance(result, list):
-                all_items.extend(result)
-            else:
-                logger.warning("Unexpected result type for query %r: %s", q.text[:60], type(result))
-
-        return all_items
-
-    async def _search_one(
-        self, query: SearchQuery, port: SearchPort | None = None
-    ) -> list[dict[str, Any]]:
-        """Execute a single query and return raw result items."""
-        active_port = port or self._search
-
-        # Import here to avoid circular imports at module level
-        from scholarship_finder.ports.search import SearchQuery as SearchPortQuery
-
-        sq = SearchPortQuery(
-            text=query.text,
-            intent=query.intent,
-            country=query.country,
-            max_results=15,  # Reduced from 25 for token efficiency
-            depth=query.depth,
-            include_domains=query.include_domains if query.include_domains else [],
-            exclude_domains=query.exclude_domains if query.exclude_domains else [],
-        )
-        result = await active_port.search(sq)
-        logger.info(
-            "Search %s returned %d hits for %r",
-            result.provider or type(active_port).__name__,
-            len(result.items),
-            query.text[:80],
-        )
-        return [
-            {
-                "url": item.url,
-                "title": item.title,
-                "snippet": item.snippet,
-                "query_id": query.id,
-                "intent": query.intent,
-            }
-            for item in result.items
-        ]
-
-
-# ── Pure deterministic helpers ────────────────────────────────────────────────
-
-def _canonicalize_and_classify(
-    raw_items: list[dict[str, Any]],
-) -> list[Candidate]:
-    """Deduplicate by canonical URL, assign trust tier, cap at MAX_CANDIDATES."""
-    seen: dict[str, Candidate] = {}
-
-    for item in raw_items:
-        url = item.get("url", "")
-        if not url or not url.startswith("http"):
-            continue
-        try:
-            canonical = canonicalize_url(url)
-            domain = extract_domain(canonical)
-            trust = classify_domain(domain)
-        except Exception:
-            continue
-
-        if canonical not in seen:
-            seen[canonical] = Candidate(
-                url=url,
-                canonical_url=canonical,
-                domain=domain,
-                trust_tier=trust,
-                kind_hint=_infer_kind(item.get("intent", "program")),
-                source_query_id=item.get("query_id", ""),
-            )
-        else:
-            # Keep higher trust tier
-            existing = seen[canonical]
-            if _tier_rank(trust) > _tier_rank(existing.trust_tier):
-                seen[canonical] = Candidate(
-                    url=existing.url,
-                    canonical_url=canonical,
-                    domain=domain,
-                    trust_tier=trust,
-                    kind_hint=existing.kind_hint,
-                    source_query_id=existing.source_query_id,
-                )
-
-    candidates = list(seen.values())
-    # Sort by trust tier (highest first) and cap
-    candidates.sort(key=lambda c: _tier_rank(c.trust_tier), reverse=True)
-    capped = candidates[:_MAX_CANDIDATES]
-    logger.info(
-        "Scout canonicalized %d unique URLs → %d candidates (cap %d)",
-        len(candidates),
-        len(capped),
-        _MAX_CANDIDATES,
-    )
-    return capped
-
-
-def _infer_kind(intent: str) -> OpportunityKind:
-    if intent == "scholarship":
-        return OpportunityKind.SCHOLARSHIP
-    elif intent == "funder":
-        return OpportunityKind.PROGRAM_WITH_FUNDING
-    return OpportunityKind.PROGRAM
-
-
-def _tier_rank(tier: TrustTier) -> int:
-    return {
-        TrustTier.OFFICIAL_INSTITUTION: 3,
-        TrustTier.RECOGNIZED_FUNDER: 2,
-        TrustTier.AGGREGATOR: 1,
-        TrustTier.UNKNOWN: 0,
-    }.get(tier, 0)
-
-
-def _get_trusted_domains(intent: str) -> list[str]:
-    """Return trusted domain list for a given intent."""
-    if intent == "scholarship":
-        return _TRUSTED_SCHOLARSHIP_DOMAINS
-    elif intent == "program":
-        return _TRUSTED_PROGRAM_DOMAINS
-    elif intent == "funder":
-        return _TRUSTED_FUNDER_DOMAINS
-    return []
-
-
-def _generate_query_variants(base_query: SearchQuery) -> list[SearchQuery]:
-    """Generate query variants for improved recall and precision.
-    
-    Creates 2-3 variants per base query:
-    1. Exact phrase match (with quotes)
-    2. Synonym expansion (if space permits)
-    3. Domain-constrained (if not already applied)
-    
-    Returns list of variants including the original.
-    """
-    import uuid
-    import re
-    
-    variants = [base_query]
-    base_text = base_query.text
-    
-    # Variant 1: Add quotes for exact phrase matching (if not already quoted)
-    if '"' not in base_text and len(base_text) < 350:
-        # Identify key phrases to quote (2-3 word sequences)
-        words = base_text.split()
-        if len(words) >= 3:
-            # Quote the first 2-3 meaningful words
-            quote_phrase = ' '.join(words[:3])
-            quoted_text = base_text.replace(quote_phrase, f'"{quote_phrase}"', 1)
-            if quoted_text != base_text and len(quoted_text) <= 400:
-                variants.append(SearchQuery(
-                    id=str(uuid.uuid4()),
-                    text=quoted_text,
-                    intent=base_query.intent,
-                    country=base_query.country,
-                    include_domains=base_query.include_domains,
-                    exclude_domains=base_query.exclude_domains,
-                    depth=base_query.depth,
-                    round_number=base_query.round_number,
-                ))
-    
-    # Variant 2: Add domain constraint if not already present
-    if not base_query.include_domains:
-        trusted_domains = _get_trusted_domains(base_query.intent)
-        if trusted_domains:
-            # Apply only a subset of domains to avoid over-restriction
-            subset_domains = trusted_domains[:3]  # Top 3 most trusted
-            variants.append(SearchQuery(
-                id=str(uuid.uuid4()),
-                text=base_text,
-                intent=base_query.intent,
-                country=base_query.country,
-                include_domains=subset_domains,
-                exclude_domains=base_query.exclude_domains,
-                depth=base_query.depth,
-                round_number=base_query.round_number,
+        for lead in leads:
+            queries.append(SearchQuery(
+                text=f'"{lead.name}" official scholarship',
+                intent="university_scholarship",
+                depth="basic", max_results=4, round_number=1,
             ))
-    
-    return variants
+        if len(state.candidates) < 10 and state.profile:
+            for country in state.profile.preferences.countries[:3]:
+                queries.append(SearchQuery(
+                    text=f"scholarships {country} international students application",
+                    intent="government_scholarship", country=country,
+                    depth="basic", max_results=6, round_number=1,
+                ))
+        if not queries:
+            return {}
+        emit("lead_expansion", f"Expanding {len(leads)} leads "
+                               f"(+{len(queries) - len(leads)} broader queries)")
+        items = await self._execute(queries)
+        new_cands = self._to_candidates(items)
+        existing = {c.canonical_url for c in state.candidates}
+        new_cands = [c for c in new_cands if c.canonical_url not in existing]
+        emit("lead_expansion", f"+{len(new_cands)} new candidates from expansion")
+        return {"candidates": state.candidates + new_cands}
+
+    # ── planning ─────────────────────────────────────────────────────────────
+
+    async def _plan(self, profile) -> SearchPlan:
+        queries: list[SearchQuery] = []
+        planner = "fallback"
+        if profile is not None:
+            try:
+                res = await self._llm.complete_json(TaskSpec(
+                    tier=LLMTier.FAST,
+                    system=_PLAN_PROMPT.format(n=_NUM_LLM_QUERIES,
+                                               profile=_profile_brief(profile)),
+                    max_output_tokens=1200, purpose="query_planning",
+                ))
+                parsed = res.parsed
+                if isinstance(parsed, dict):
+                    parsed = next((v for v in parsed.values() if isinstance(v, list)), [])
+                for q in parsed or []:
+                    if isinstance(q, dict) and q.get("text"):
+                        queries.append(SearchQuery(
+                            text=str(q["text"])[:200],
+                            intent=str(q.get("intent") or "university_scholarship"),
+                            country=q.get("country") or None,
+                            depth=_depth_for(q.get("intent")),
+                            max_results=8,
+                        ))
+                if queries and profile is not None and profile.preferences.countries:
+                    allowed = {c.lower() for c in profile.preferences.countries}
+                    queries = [q for q in queries
+                               if not q.country or q.country.lower() in allowed]
+                if queries:
+                    planner = "llm"
+            except Exception as exc:
+                emit("opportunity_scout",
+                     f"LLM query planning failed ({type(exc).__name__}) — template fallback")
+        queries = self._complement(profile, queries)
+        return SearchPlan(queries=queries, planner=planner)
+
+    def _complement(self, profile, queries: list[SearchQuery]) -> list[SearchQuery]:
+        """Guarantee ≥1 query per target country (≤4) + ≥2 nationality queries."""
+        countries = (profile.preferences.countries if profile else [])[:4]
+        nat = (profile.nationality if profile else "") or ""
+        have = {((q.country or "").lower()) for q in queries}
+        nat_hits = sum(1 for q in queries if nat and nat.lower() in q.text.lower())
+        for c in countries:
+            if c.lower() not in have:
+                queries.append(SearchQuery(
+                    text=f"{c} government scholarship international students",
+                    intent="government_scholarship", country=c,
+                    depth="advanced", max_results=8,
+                ))
+        while nat and nat_hits < 2:
+            queries.append(SearchQuery(
+                text=f"{nat} students scholarship {countries[0] if countries else ''} fully funded",
+                intent="need_based", depth="advanced", max_results=8,
+            ))
+            nat_hits += 1
+        if not queries:
+            queries = _template_queries(profile)
+        return queries[:12]
+
+    # ── proposer: LLM-proposed named programs → leads ───────────────────────
+
+    async def _propose(self, profile, bus) -> list[dict]:
+        """One REASONING complete_json → up to 30 real named programs."""
+        if profile is None:
+            return []
+        try:
+            res = await self._llm.complete_json(TaskSpec(
+                tier=LLMTier.REASONING,
+                system=_PROPOSE_PROMPT.format(profile=_profile_brief(profile)),
+                max_output_tokens=2500, purpose="program_proposal"))
+            parsed = res.parsed
+            if isinstance(parsed, dict):
+                parsed = next((v for v in parsed.values() if isinstance(v, list)), [])
+            out = [d for d in (parsed or []) if isinstance(d, dict) and d.get("name")]
+            target = (profile.preferences.degree_level or "").lower()
+            BAD = {"masters": ("doctor", "phd", "postdoc", "undergrad", "bachelor"),
+                   "phd": ("undergrad", "bachelor"),
+                   "bachelors": ("doctor", "phd", "postdoc", "masters")}
+            if target:
+                bad = BAD.get(target, ())
+                out = [d for d in out
+                       if not any(b in str(d.get("degree_level") or "").lower()
+                                  for b in bad)]
+            targets = [c.strip().lower() for c in profile.preferences.countries if c.strip()]
+            if targets:
+                def _host_ok(d: dict) -> bool:
+                    host = str(d.get("host_country") or "").strip().lower()
+                    return not host or any(t in host or host in t for t in targets)
+                out = [d for d in out if _host_ok(d)]
+            emit("opportunity_scout", f"Proposer suggested {len(out)} named programs")
+            return out[:30]
+        except Exception as exc:
+            emit("opportunity_scout",
+                 f"Proposer failed ({type(exc).__name__}) — search only")
+            return []
+
+    # ── resolver: name → official page ───────────────────────────────────────
+
+    async def _resolve(self, items: list[dict], bus) -> list[dict]:
+        """Search each proposed/lead name for its official page (≤6 in flight)."""
+        sem = asyncio.Semaphore(6)
+        hits: list[dict] = []
+
+        async def one(d: dict) -> None:
+            name = str(d.get("name") or "").strip()
+            if len(name) < 4:
+                return
+            hint = (d.get("official_domain_hint") or "").strip()
+            toks = [t for t in re.findall(r"[A-Za-z]{3,}", name.lower())
+                    if t not in _STOP_TOKENS]
+            def _overlap(it) -> float:
+                if not toks:
+                    return 0.0
+                hay = _norm(str(it.title) + " " + str(it.snippet) + " " + it.url)
+                return sum(1 for t in toks if t in hay) / len(toks)
+            async with sem:
+                for doms in ([hint] if hint else [], []):
+                    try:
+                        pq = PortQuery(
+                            text=q_text(name, d)[:250],
+                            intent="university_scholarship", depth="basic",
+                            max_results=5,
+                            include_domains=list(doms))
+                        r = await self._search_any(pq)
+                    except Exception:
+                        break
+                    best = None; best_key = (-1.0, 0)
+                    for it in r.items:
+                        dom = extract_domain(it.url)
+                        if hint and doms and hint not in dom:
+                            continue
+                        if classify_domain(dom) == TrustTier.AGGREGATOR:
+                            continue
+                        ov = _overlap(it)
+                        if ov < 0.5:
+                            continue
+                        html = 1 if not it.url.lower().endswith(".pdf") else 0
+                        if (ov, html) > best_key:
+                            best_key = (ov, html); best = it
+                    if best is not None:
+                        hits.append({"url": best.url, "title": best.title,
+                                     "snippet": best.snippet, "query_id": "",
+                                     "intent": "proposed",
+                                     "country": d.get("host_country"),
+                                     "proposed_name": name})
+                        return
+                    if not hint:
+                        break
+                return
+
+        await asyncio.gather(*[one(d) for d in items[:30]])
+        emit("opportunity_scout", f"Resolver: {len(hits)}/{len(items)} proposed → official pages")
+        return hits
+
+    # ── registry channel: official scholarship directories per country ───────
+
+    @staticmethod
+    def _registry() -> dict:
+        import json
+        from pathlib import Path
+        f = (Path(__file__).parent.parent / "domain" / "data"
+             / "official_sources.json")
+        try:
+            return json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def _registry_queries(self, profile) -> list[SearchQuery]:
+        reg = self._registry()
+        countries = [c.lower() for c in
+                     (profile.preferences.countries if profile else [])][:4]
+        level = (profile.preferences.degree_level if profile else "") or "masters"
+        fields = " ".join((profile.preferences.target_fields if profile else [])
+                          or [])[:40]
+        nat = (profile.nationality if profile else "") or ""
+        out: list[SearchQuery] = []
+        for c in countries:
+            doms = reg.get(c) or reg.get("_multi", [])
+            if not doms:
+                continue
+            out.append(SearchQuery(
+                text=f"{level} {fields} scholarship {nat} students".strip(),
+                intent="government_scholarship", country=c.title(),
+                include_domains=doms, depth="basic", max_results=8))
+        if nat and nat.lower() in ("indian", "nigerian"):
+            key = "_india_out" if "ind" in nat.lower() else "_nigeria_out"
+            out.append(SearchQuery(
+                text=f"{level} {fields} scholarship {nat} students abroad".strip(),
+                intent="government_scholarship",
+                include_domains=reg.get(key, []),
+                depth="basic", max_results=6))
+        return out
+
+    # ── official-TLD search channel ──────────────────────────────────────────
+
+    def _official_channel_queries(self, profile) -> list[SearchQuery]:
+        countries = (profile.preferences.countries if profile else [])[:4]
+        level = (profile.preferences.degree_level if profile else "") or "masters"
+        out = []
+        for c in countries:
+            domains = _TLD_HINTS.get(c.lower(), _TLD_FALLBACK)
+            out.append(SearchQuery(
+                text=f"{level} scholarships international students {c}",
+                intent="government_scholarship", country=c,
+                include_domains=domains, depth="basic", max_results=8))
+        return out
+
+    # ── execution ────────────────────────────────────────────────────────────
+
+    async def _execute(self, queries: list[SearchQuery]) -> list[dict]:
+        async def one(q: SearchQuery) -> list[dict]:
+            pq = PortQuery(
+                text=q.text, intent=q.intent, country=q.country,
+                depth=q.depth, max_results=q.max_results,
+                include_domains=q.include_domains,
+                exclude_domains=q.exclude_domains, time_range="y",
+            )
+            try:
+                r = await self._search_any(pq)
+                return [{"url": i.url, "title": i.title, "snippet": i.snippet,
+                         "query_id": q.id, "intent": q.intent,
+                         "country": q.country} for i in r.items]
+            except Exception as exc:
+                emit("opportunity_scout", f"Query failed: {q.text[:50]} ({type(exc).__name__})")
+                return []
+        results = await asyncio.gather(*[one(q) for q in queries])
+        return [it for sub in results for it in sub]
+
+    async def _search_any(self, pq: PortQuery):
+        """Primary search, falling back to the secondary on any failure."""
+        try:
+            return await self._search.search(pq)
+        except Exception:
+            if self._secondary is None:
+                raise
+            return await self._secondary.search(pq)
+
+    # ── candidates ───────────────────────────────────────────────────────────
+
+    def _to_candidates(self, items: list[dict]) -> list[Candidate]:
+        seen: dict[str, Candidate] = {}
+        for it in items:
+            url = (it.get("url") or "").strip()
+            if not url.startswith("http"):
+                continue
+            canonical = canonicalize_url(url)
+            if canonical in seen:
+                continue
+            domain = extract_domain(url)
+            tier = classify_domain(domain)
+            if tier == TrustTier.AGGREGATOR:
+                continue
+            cand = Candidate(
+                url=url, canonical_url=canonical, domain=domain,
+                trust_tier=tier, source_query_id=str(it.get("query_id", "")),
+                title=it.get("title") or None, snippet=it.get("snippet") or None,
+                origin="search", country_hint=it.get("country"),
+            )
+            cand.prior_score = _prior_score(cand, it)
+            seen[canonical] = cand
+        return list(seen.values())
 
 
-def _fallback_queries(profile: Any, round_number: int) -> list[SearchQuery]:
-    """Enhanced fallback with query expansion when LLM query planning fails.
+# ── helpers ───────────────────────────────────────────────────────────────────
 
-    Uses multiple funding keyword variants and synonyms to improve recall.
-    """
-    import uuid
-    # Handle missing preferences gracefully
-    if profile.preferences:
-        prefs = profile.preferences
-        country = prefs.countries[0] if prefs.countries else "international"
-        field = prefs.target_fields[0] if prefs.target_fields else "graduate"
-        level = prefs.degree_level or "masters"
-    else:
-        country = "international"
-        field = "graduate"
-        level = "masters"
+def _depth_for(intent: Any) -> str:
+    return "advanced" if intent in (
+        "government_scholarship", "need_based", "field_fellowship") else "basic"
 
-    # Query expansion: multiple keyword variants for each intent
-    return [
-        # Variant 1: Direct funding terms with exact phrase matching
-        SearchQuery(
-            id=str(uuid.uuid4()),
-            text=f'"fully funded" {level} {field} scholarship {country} stipend',
-            intent="scholarship",
-            country=country,
-            include_domains=[],
-            exclude_domains=_EXCLUDE_DOMAINS,
-            depth="advanced",
-            round_number=round_number,
-        ),
-        # Variant 2: Synonym expansion for financial aid
-        SearchQuery(
-            id=str(uuid.uuid4()),
-            text=f'{level} {field} scholarship {country} (financial aid OR "tuition waiver" OR grant)',
-            intent="scholarship",
-            country=country,
-            include_domains=[],
-            exclude_domains=_EXCLUDE_DOMAINS,
-            depth="advanced",
-            round_number=round_number,
-        ),
-        # Variant 3: Program funding with institutional language
-        SearchQuery(
-            id=str(uuid.uuid4()),
-            text=f'{level} program {field} {country} "with funding" OR assistantship OR fellowship',
-            intent="program",
-            country=country,
-            include_domains=[],
-            exclude_domains=_EXCLUDE_DOMAINS,
-            depth="advanced",
-            round_number=round_number,
-        ),
-        # Variant 4: International-specific funding opportunities
-        SearchQuery(
-            id=str(uuid.uuid4()),
-            text=f'"fully funded" {level} scholarship {country} international students OR global',
-            intent="scholarship",
-            country=country,
-            include_domains=[],
-            exclude_domains=_EXCLUDE_DOMAINS,
-            depth="advanced",
-            round_number=round_number,
-        ),
-        # Variant 5: Research-focused funding and fellowships
-        SearchQuery(
-            id=str(uuid.uuid4()),
-            text=f'{field} graduate fellowship {country} "research funding" OR grant OR endowment',
-            intent="funder",
-            country=country,
-            include_domains=[],
-            exclude_domains=_EXCLUDE_DOMAINS,
-            depth="advanced",
-            round_number=round_number,
-        ),
-    ]
+
+def _max_audit() -> int:
+    try:
+        from scholarship_finder.config import get_settings
+        return get_settings().max_audit_candidates
+    except Exception:
+        return 18
+
+
+def _prior_score(c: Candidate, item: dict) -> float:
+    s = {TrustTier.OFFICIAL_INSTITUTION: 3.0, TrustTier.RECOGNIZED_FUNDER: 2.0,
+         TrustTier.UNKNOWN: 1.0}.get(c.trust_tier, 1.0)
+    blob = f"{c.title or ''} {c.snippet or ''} {c.url}".lower()
+    if _FUNDING_WORDS.search(blob):
+        s += 1.5
+    if c.country_hint and c.country_hint.lower() in blob:
+        s += 0.5
+    if _INDEX_HINT.search(urlparse(c.url).path):
+        s -= 1.5
+    return round(s, 2)
+
+
+def _profile_brief(p) -> str:
+    edu = p.primary_education()
+    return (
+        f"target: {p.preferences.degree_level or 'study'} in "
+        f"{', '.join(p.study_fields()[:3]) or 'any field'} | "
+        f"countries: {', '.join(p.preferences.countries[:4]) or 'open'} | "
+        f"nationality: {p.nationality or 'not stated'} | "
+        f"funding need: {p.financial_need.level} | "
+        f"level: {(edu.level if edu else '') or p.current_level or 'unknown'} | "
+        f"languages: {', '.join(p.languages[:4]) or 'english'}"
+    )
+
+
+def _template_queries(profile) -> list[SearchQuery]:
+    countries = (profile.preferences.countries if profile else [])[:4] or [""]
+    level = (profile.preferences.degree_level if profile else "") or "masters"
+    out = []
+    for c in countries:
+        out.append(SearchQuery(
+            text=f"fully funded {level} scholarships {c} international students".strip(),
+            intent="government_scholarship", country=c or None,
+            depth="advanced", max_results=8))
+        out.append(SearchQuery(
+            text=f"university {level} scholarship {c} tuition waiver".strip(),
+            intent="university_scholarship", country=c or None,
+            depth="basic", max_results=8))
+    nat = (profile.nationality if profile else "") or "international"
+    out.append(SearchQuery(
+        text=f"{nat} students fully funded {level} scholarship",
+        intent="need_based", depth="advanced", max_results=8))
+    return out

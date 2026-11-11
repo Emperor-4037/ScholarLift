@@ -53,12 +53,10 @@ def reduce_run_meta(current: RunMeta, delta: dict) -> RunMeta:
 
     Allowed mutations:
       - phase: must advance forward (INTAKE → PHASE_A → PHASE_B → COMPLETED)
-      - outcome: may only be set once from IN_PROGRESS to a terminal state
-      - budgets.reasoning_calls_used: may only increase
-      - budgets.fast_calls_used: may only increase
-      - budgets.search_credits_used: may only increase
-      - budgets.fetch_count: may only increase
-      - retry_count: may only increase
+        A same-phase update is a no-op (idempotent).
+      - outcome: may only be set once from IN_PROGRESS to a terminal state;
+        a same-outcome update (e.g. still IN_PROGRESS) is a no-op.
+      - expansion_rounds: may only increase
       - degradation_flags: append-only
 
     Raises:
@@ -77,33 +75,25 @@ def reduce_run_meta(current: RunMeta, delta: dict) -> RunMeta:
             raise ValueError(
                 f"Backward phase transition: {current.phase} → {new_phase}"
             )
+        # Same-phase is a no-op (idempotent)
         data["phase"] = new_phase
 
-    # Outcome: set once
+    # Outcome: set once; same-value and no-op updates are allowed
     if "outcome" in delta:
         new_outcome = RunOutcome(delta["outcome"])
         if current.outcome != RunOutcome.IN_PROGRESS:
-            raise ValueError(
-                f"outcome already set to {current.outcome}; cannot set to {new_outcome}"
-            )
+            # Allow idempotent same-value update
+            if new_outcome != current.outcome:
+                raise ValueError(
+                    f"outcome already set to {current.outcome}; cannot set to {new_outcome}"
+                )
         data["outcome"] = new_outcome
 
-    # Budget increments (monotonic)
-    if "budgets" in delta:
-        b_delta = delta["budgets"]
-        b = data["budgets"]
-        for key in ("reasoning_calls_used", "fast_calls_used", "search_credits_used", "fetch_count"):
-            if key in b_delta:
-                new_val = b_delta[key]
-                if new_val < b[key]:
-                    raise ValueError(f"Budget counter {key} cannot decrease: {b[key]} → {new_val}")
-                b[key] = new_val
-
-    # retry_count monotonic
-    if "retry_count" in delta:
-        if delta["retry_count"] < current.retry_count:
-            raise ValueError("retry_count cannot decrease")
-        data["retry_count"] = delta["retry_count"]
+    # expansion_rounds monotonic
+    if "expansion_rounds" in delta:
+        if delta["expansion_rounds"] < current.expansion_rounds:
+            raise ValueError("expansion_rounds cannot decrease")
+        data["expansion_rounds"] = delta["expansion_rounds"]
 
     # degradation_flags append-only
     if "degradation_flags" in delta:
@@ -118,7 +108,11 @@ def reduce_profile(
     current: CandidateProfile | None,
     new_profile: CandidateProfile,
 ) -> CandidateProfile:
-    """Write the candidate profile once; raise if already set."""
+    """Write the candidate profile once; raise if already set.
+
+    Single-write invariant: once profile is set, any subsequent write raises,
+    regardless of whether the new value equals the existing one.
+    """
     if current is not None:
         raise ValueError("CandidateProfile is already set; single-write invariant violated")
     return new_profile
@@ -266,9 +260,15 @@ def reduce_assessments(
 ) -> tuple[list[EligibilityAssessment], list[str]]:
     """Single-write replace for assessments and top_5.
 
-    Raises ValueError if assessments have already been written.
+    Idempotent: if current is non-empty and new_assessments is the same list
+    object, returns current unchanged (no-op).
+
+    Raises ValueError if assessments have already been written to a *different* value.
     """
     if current:
+        # Idempotent: allow the same list object
+        if current is new_assessments:
+            return current, top_5
         raise ValueError("Assessments already written; single-write invariant violated")
     return new_assessments, top_5
 

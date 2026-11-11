@@ -1,369 +1,186 @@
-"""Agent 4: Ranking Strategist
+"""Agent 4: Ranking Strategist — deterministic eligibility + scored top-5.
 
-Responsibilities (architecture §1.3, Agent 4):
-- Deterministic tri-state eligibility rule evaluation (no LLM)
-- Gap derivation (UNKNOWN/UNMET → actionable gaps with severity)
-- ONE batched reasoning-tier LLM call for field-alignment scoring
-  (0-1 score: how well does each opportunity match the candidate's field?)
-- Weighted composite scoring via scoring.py
-- Rank top-5 opportunities by composite score
-- Return updated SwarmState with assessments + top_5
-
-DEC-1: reasoning tier capped at ≤4 per run. This agent uses 1 call.
+Rules and all displayed numbers are deterministic; the LLM only supplies
+judgements (field alignment, profile strength, nationality/field judgement,
+rationale ≤60 words, strengths, concerns) in ONE reasoning complete_json
+(≤20 opps, overflow → fast). Fallback: keyword overlap + templated rationale.
 """
 from __future__ import annotations
 
-import json
-import logging
-from datetime import datetime, timezone
 from typing import Any
 
+import logging
+from datetime import date
+
+from scholarship_finder.domain import eligibility, scoring
 from scholarship_finder.domain.models import (
-    ActionableGap,
-    ComponentScore,
     EligibilityAssessment,
-    EligibilityRule,
-    Event,
     EventKind,
     EventSeverity,
-    FundingLevel,
-    GapSeverity,
     LLMTier,
-    Opportunity,
     SwarmState,
+    TrustTier,
 )
-from scholarship_finder.domain.reducers import reduce_assessments
-from scholarship_finder.domain.scoring import (
-    CompositeScore,
-    ScoringInput,
-    compute_composite_score,
-    rank_opportunities,
-)
-from scholarship_finder.domain.tri_state import (
-    derive_gaps,
-    evaluate_citizenship,
-    evaluate_degree_field,
-    evaluate_degree_level,
-    evaluate_document_availability,
-    evaluate_gpa_minimum,
-    evaluate_language_test,
-    has_blocking_unmet,
-)
+from scholarship_finder.engine.context import emit
 from scholarship_finder.engine.event_bus import EventBus
 from scholarship_finder.ports.llm import LLMPort, TaskSpec
 
 logger = logging.getLogger(__name__)
 
-_ALIGNMENT_PROMPT = """\
-You are a graduate admissions expert. For each opportunity below, score field alignment (0.0-1.0) and provide a rationale (max 4 lines, 40 words).
+_PROMPT = """Judge each opportunity against the student. Return a JSON array,
+one object per opportunity id in order:
+[{{"id": "<id>", "field_alignment": 0-1, "profile_strength": 0-1,
+"nationality_judgement": true|false|null, "field_judgement": true|false|null,
+"rationale": "<=60 words citing profile + opportunity facts",
+"strengths": [str], "concerns": [str]}}]
 
-Return ONLY valid JSON array (no markdown):
-[
-  {{"opportunity_id": "<id>", "field_alignment": <float 0.0-1.0>, "rationale": "<concise rationale>"}},
-  ...
-]
-
-Candidate fields: {candidate_fields}
-Candidate skills: {candidate_skills}
+Student: {profile}
 
 Opportunities:
-{opps_block}
-"""
+{opps}"""
 
 
 class RankingStrategistAgent:
-    """Agent 4: Evaluates eligibility, aligns fields, scores, and ranks opportunities."""
-
     def __init__(self, llm_port: LLMPort) -> None:
         self._llm = llm_port
 
-    async def run(self, state: SwarmState, bus: EventBus) -> SwarmState:
-        """Rank opportunities and return updated state with assessments + top_5."""
-        run_id = state.run_meta.run_id
+    async def run(self, state: SwarmState, bus: EventBus) -> dict:
         profile = state.profile
-        opportunities = state.opportunities
+        if profile is None:
+            emit("ranking_strategist", "No profile — skipping ranking")
+            return {}
+        opps = [o for o in state.opportunities
+                if o.is_existence_verified()
+                and o.verification.trust_tier != TrustTier.AGGREGATOR]
+        if not opps:
+            emit("ranking_strategist", "No verified opportunities to rank")
+            return {}
+        judgements = await self._judge(profile, opps)
 
-        if not profile or not opportunities:
-            logger.warning("RankingStrategist: missing profile or opportunities")
-            return state
-
-        await bus.publish(Event(
-            run_id=run_id,
-            seq=0,
-            timestamp=datetime.now(timezone.utc),
-            node="ranking_strategist",
-            severity=EventSeverity.INFO,
-            kind=EventKind.NODE_STARTED,
-            payload={"node": "ranking_strategist", "opp_count": len(opportunities)},
-        ))
-
-        # ── Step 1: Deterministic tri-state eligibility (no LLM) ─────────────
-        rule_results_by_opp = self._evaluate_eligibility(profile, opportunities)
-
-        # ── Step 2: ONE reasoning-tier alignment call (batched) ───────────────
-        alignment_scores, alignment_rationales = await self._get_alignment_scores(profile, opportunities, run_id)
-
-        # ── Step 3: Weighted scoring ──────────────────────────────────────────
-        scored: list[tuple[str, CompositeScore]] = []
-        for opp in opportunities:
-            rule_results = rule_results_by_opp.get(opp.id, [])
-            blocking = has_blocking_unmet(rule_results)
-
-            gpa_margin = self._compute_gpa_margin(profile, opp)
-            field_align = alignment_scores.get(opp.id, 0.5)
-
-            evidence_conf = opp.verification.completeness_score if opp.verification else 0.5
-            deadline_days = self._deadline_distance(opp)
-
-            inp = ScoringInput(
-                gpa_margin=gpa_margin,
-                field_alignment=field_align,
-                funding_level=(opp.funding.level if opp.funding else None) or FundingLevel.UNKNOWN,
-                feasibility_score=0.7 if not blocking else 0.2,
-                evidence_confidence=evidence_conf,
-                has_blocking_unmet=blocking,
-                deadline_distance_days=deadline_days,
+        assessments: list[EligibilityAssessment] = []
+        for opp in opps:
+            j = judgements.get(opp.id, {})
+            rules = eligibility.evaluate_rules(profile, opp, j)
+            status = eligibility.classify_status(rules)
+            days = _days(opp)
+            margin = _gpa_margin(rules)
+            ev_conf = opp.verification.completeness_score or 0.0
+            composite, components = scoring.score_opportunity(
+                opp, status=status, rules=rules,
+                field_alignment=_num(j.get("field_alignment"), _kw(profile, opp)),
+                profile_strength=_num(j.get("profile_strength"), 0.5),
+                gpa_margin=margin, days_to_deadline=days,
+                evidence_confidence=ev_conf,
             )
-            score = compute_composite_score(inp)
-            scored.append((opp.id, score))
-
-        # ── Step 4: Rank and select top-5 ────────────────────────────────────
-        # Build URL mapping for diversity check
-        opp_urls = {opp.id: opp.official_url for opp in opportunities}
-        ranked = rank_opportunities(scored, opp_urls=opp_urls)
-        top_5_ids = [opp_id for opp_id, _, _ in ranked[:5]]
-
-        # ── Step 5: Build EligibilityAssessment objects ───────────────────────
-        assessments = self._build_assessments(
-            opportunities, rule_results_by_opp, scored, ranked, alignment_scores, alignment_rationales
-        )
-
-        new_state = state.model_copy(deep=True)
-        new_assessments, new_top5 = reduce_assessments(
-            state.assessments, assessments, top_5_ids
-        )
-        new_state.assessments = new_assessments
-        new_state.top_5 = new_top5
-
-        await bus.publish(Event(
-            run_id=run_id,
-            seq=0,
-            timestamp=datetime.now(timezone.utc),
-            node="ranking_strategist",
-            severity=EventSeverity.INFO,
-            kind=EventKind.NODE_COMPLETED,
-            payload={
-                "node": "ranking_strategist",
-                "top_5": top_5_ids,
-                "reasoning_calls_used": state.run_meta.budgets.reasoning_calls_used + 1,
-            },
-        ))
-
-        return new_state
-
-    # ── Private helpers ───────────────────────────────────────────────────────
-
-    def _evaluate_eligibility(self, profile: Any, opportunities: list[Opportunity]) -> dict:
-        """Run deterministic tri-state rules for each opportunity."""
-        results = {}
-
-        # Extract candidate values once
-        candidate_gpa: float | None = None
-        candidate_fields: list[str] = []
-        candidate_lang_score: float | None = None
-
-        for edu in (profile.education or []):
-            if edu.normalized_gpa and candidate_gpa is None:
-                candidate_gpa = edu.normalized_gpa.value
-            if edu.field:
-                candidate_fields.append(edu.field)
-
-        for lt in (profile.language_tests or []):
-            if lt.overall_score is not None:
-                candidate_lang_score = lt.overall_score
-                break
-
-        candidate_degree_level = getattr(profile.preferences, "degree_level", None)
-
-        for opp in opportunities:
-            opp_fields = [opp.degree_level] if opp.degree_level else []
-            results[opp.id] = [
-                evaluate_gpa_minimum(candidate_gpa, None),           # required GPA unknown from page
-                evaluate_degree_field(candidate_fields, opp_fields),
-                evaluate_language_test(candidate_lang_score, None),  # required score unknown
-                evaluate_degree_level(candidate_degree_level, opp.degree_level),
-                evaluate_citizenship(),
-                evaluate_document_availability(),
-            ]
-
-        return results
-
-    async def _get_alignment_scores(
-        self, profile: Any, opportunities: list[Opportunity], run_id: str
-    ) -> tuple[dict[str, float], dict[str, str]]:
-        """ONE reasoning-tier LLM call to score field alignment for all opps.
-        
-        Returns tuple of (scores_dict, rationales_dict) where rationales_dict maps
-        opportunity_id to the LLM-generated rationale string.
-        """
-        if not opportunities:
-            return {}, {}
-
-        prefs = profile.preferences
-        candidate_fields = ", ".join(prefs.target_fields[:5]) if prefs.target_fields else "general"
-        candidate_skills = ", ".join(profile.skills[:10]) if profile.skills else "none"
-
-        opps_block = "\n".join(
-            f"- ID: {opp.id[:8]} | Name: {opp.name} | Field: {opp.degree_level} | "
-            f"Country: {opp.country} | Funding: {opp.funding.level.value if opp.funding else 'unknown'}"
-            for opp in opportunities[:20]  # batch cap
-        )
-
-        task = TaskSpec(
-            tier=LLMTier.REASONING,
-            instruction=_ALIGNMENT_PROMPT.format(
-                candidate_fields=candidate_fields,
-                candidate_skills=candidate_skills,
-                opps_block=opps_block,
-            ),
-            data_blocks=[],
-            output_schema=None,
-            max_output_tokens=2000,
-            reasoning_effort="low",  # minimize tokens for this batch
-        )
-
-        try:
-            result = await self._llm.complete(task)
-            raw = result.content.strip()
-            if raw.startswith("```"):
-                raw = raw.split("```")[1]
-                if raw.startswith("json"):
-                    raw = raw[4:]
-            data = json.loads(raw)
-            scores = {}
-            rationales = {}
-            for item in data:
-                opp_id_prefix = item.get("opportunity_id", "")
-                score = float(item.get("field_alignment", 0.5))
-                rationale = item.get("rationale", "")
-                # Match by prefix since we truncated ID to 8 chars in the prompt
-                for opp in opportunities:
-                    if opp.id.startswith(opp_id_prefix) or opp.id == opp_id_prefix:
-                        scores[opp.id] = max(0.0, min(1.0, score))
-                        rationales[opp.id] = rationale
-                        break
-            return scores, rationales
-        except Exception as exc:
-            logger.warning("Alignment scoring failed: %s — using neutral 0.5 for all", exc)
-            return {opp.id: 0.5 for opp in opportunities}, {opp.id: "Alignment scoring failed" for opp in opportunities}
-
-    def _compute_gpa_margin(self, profile: Any, opp: Opportunity) -> float | None:
-        """Compute how much the candidate's GPA exceeds any stated minimum."""
-        candidate_gpa: float | None = None
-        for edu in (profile.education or []):
-            if edu.normalized_gpa:
-                candidate_gpa = edu.normalized_gpa.value
-                break
-        if candidate_gpa is None:
-            return None
-        # Assume a standard minimum of 3.0 on 4.0 scale if not stated
-        return candidate_gpa - 3.0
-
-    def _deadline_distance(self, opp: Opportunity) -> int | None:
-        """Return days until the nearest deadline, or None."""
-        if not opp.deadlines:
-            return None
-        today = datetime.now(timezone.utc).date()
-        for dl in opp.deadlines:
-            if dl.date:
-                try:
-                    from dateutil.parser import parse as parse_date
-                    from dateutil.tz import gettz
-                    # Common timezone abbreviations mapping
-                    tzinfos = {
-                        'ET': gettz('America/New_York'),
-                        'EST': gettz('America/New_York'),
-                        'EDT': gettz('America/New_York'),
-                        'CT': gettz('America/Chicago'),
-                        'CST': gettz('America/Chicago'),
-                        'CDT': gettz('America/Chicago'),
-                        'PT': gettz('America/Los_Angeles'),
-                        'PST': gettz('America/Los_Angeles'),
-                        'PDT': gettz('America/Los_Angeles'),
-                        'MT': gettz('America/Denver'),
-                        'MST': gettz('America/Denver'),
-                        'MDT': gettz('America/Denver'),
-                    }
-                    deadline_date = parse_date(dl.date, tzinfos=tzinfos).date()
-                    days = (deadline_date - today).days
-                    if days >= 0:
-                        return days
-                except Exception:
-                    pass
-        return None
-
-    def _build_assessments(
-        self,
-        opportunities: list[Opportunity],
-        rule_results_by_opp: dict,
-        scored: list[tuple[str, CompositeScore]],
-        ranked: list[tuple],
-        alignment_scores: dict[str, float],
-        alignment_rationales: dict[str, str],
-    ) -> list[EligibilityAssessment]:
-        """Build EligibilityAssessment objects for all opportunities."""
-        score_map = {opp_id: score for opp_id, score in scored}
-        rank_map = {opp_id: rank for opp_id, _, rank in ranked}
-
-        assessments = []
-        for opp in opportunities:
-            rule_results = rule_results_by_opp.get(opp.id, [])
-            score = score_map.get(opp.id)
-            rank = rank_map.get(opp.id)
-            gaps = derive_gaps(rule_results)
-            rationale = alignment_rationales.get(opp.id, "")
-
-            eligibility_rules = [
-                EligibilityRule(
-                    rule_name=r.rule_name,
-                    result=r.result,
-                    candidate_value=r.candidate_value,
-                    required_value=r.required_value,
-                    evidence_ref=None,
-                )
-                for r in rule_results
-            ]
-
-            actionable_gaps = [
-                ActionableGap(
-                    gap_type=g.get("type", "unknown"),
-                    description=g.get("description", ""),
-                    remedy=g.get("remedy", ""),
-                    severity=GapSeverity(g.get("severity", "MEDIUM")),
-                    blocking=g.get("blocking", False),
-                )
-                for g in gaps
-            ]
-
-            component_scores = []
-            if score:
-                for comp_name, comp_val in score.components.items():
-                    component_scores.append(ComponentScore(
-                        component=comp_name,
-                        score=comp_val,
-                        weight=0.2,  # simplified — actual weights in scoring.py
-                        explanation="",
-                    ))
-
             assessments.append(EligibilityAssessment(
-                opportunity_id=opp.id,
-                rules=eligibility_rules,
-                gaps=actionable_gaps,
-                component_scores=component_scores,
-                composite_score=score.total if score else 0.0,
-                rank=rank,
-                confidence=opp.verification.completeness_score if opp.verification else 0.5,
-                rationale=rationale or f"Score: {score.total:.1f}/100, Rank: {rank}" if score and rank else "",
+                opportunity_id=opp.id, status=status, rules=rules,
+                component_scores=components, composite_score=composite,
+                confidence=ev_conf,
+                rationale=_text(j.get("rationale")) or _fallback_rationale(status, margin),
+                strengths=_str_list(j.get("strengths")),
+                concerns=_str_list(j.get("concerns")),
+                days_to_deadline=days,
             ))
+        top5 = scoring.select_top_five(assessments, opps,
+                                       allowed_statuses=(
+                                           "eligible", "likely_eligible",
+                                           "near_miss", "requirements_unverified"),
+                                       require_evidence=True)
+        emit("ranking_strategist",
+             f"Top {len(top5)} of {len(opps)} verified opportunities ranked",
+             kind=EventKind.PHASE_A_READY,
+             severity=EventSeverity.INFO if top5 else EventSeverity.WARNING,
+             top_5=top5, opportunity_count=len(opps))
+        return {"assessments": assessments, "top_5": top5}
 
-        return assessments
+    async def _judge(self, profile, opps) -> dict[str, dict]:
+        block = "\n".join(
+            f"- id={o.id} | {o.name} | {o.institution_or_funder} | "
+            f"{o.country or o.host_countries} | levels={o.degree_levels or o.degree_level} | "
+            f"fields={o.fields_of_study} | eligibility_text={o.eligibility.nationality_text or ''}"
+            for o in opps[:20])
+        try:
+            res = await self._llm.complete_json(TaskSpec(
+                json_schema={"type": "array", "items": {"type": "object"}},
+                tier=LLMTier.REASONING,
+                system=_PROMPT.format(profile=_brief(profile), opps=block),
+                max_output_tokens=3000, purpose="alignment_scoring"))
+            parsed = res.parsed
+            items = parsed
+            if isinstance(items, dict):
+                items = next((v for v in items.values() if isinstance(v, list)), [])
+            out: dict[str, dict] = {}
+            for i, d in enumerate(items or []):
+                if not isinstance(d, dict):
+                    continue
+                oid = (d.get("id") or d.get("opportunity_id")
+                       or d.get("opp_id")
+                       or (opps[i].id if i < len(opps) else None))
+                if oid:
+                    out[str(oid)] = d
+            return out
+        except Exception as exc:
+            logger.warning("alignment parse failed (%r); raw=%r",
+                           exc, getattr(res, "parsed", None) if "res" in dir() else None)
+            emit("ranking_strategist",
+                 f"LLM alignment failed ({type(exc).__name__}) — keyword fallback")
+            return {}
+
+
+def _brief(p) -> str:
+    return (f"nationality={p.nationality or '?'} level={p.preferences.degree_level or '?'} "
+            f"fields={p.study_fields()[:3]} countries={p.preferences.countries[:4]} "
+            f"skills={p.skills[:8]} tests={[f'{t.test_name}:{t.overall_score}' for t in p.language_tests]}")
+
+
+def _days(opp) -> int | None:
+    dl = opp.next_deadline()
+    if dl and dl.iso_date:
+        try:
+            return (date.fromisoformat(dl.iso_date[:10]) - date.today()).days
+        except ValueError:
+            return None
+    return None
+
+
+def _gpa_margin(rules) -> float | None:
+    for r in rules:
+        if r.rule_name == "gpa" and r.gap_size is not None:
+            return -r.gap_size
+        if r.rule_name == "gpa" and r.result.value == "MET":
+            return 0.0
+    return None
+
+
+def _num(v: Any, d: float) -> float:
+    return float(v) if isinstance(v, (int, float)) else d
+
+
+def _text(v: Any) -> str:
+    return v.strip() if isinstance(v, str) else ""
+
+
+def _str_list(v: Any) -> list[str]:
+    """LLM lists may be a string, nested lists or contain non-strings."""
+    if isinstance(v, str):
+        v = [v]
+    if not isinstance(v, list):
+        return []
+    out: list[str] = []
+    for item in v:
+        if isinstance(item, list):
+            out.extend(_str_list(item))
+        elif isinstance(item, (str, int, float)) and str(item).strip():
+            out.append(str(item).strip())
+    return out[:6]
+
+
+def _kw(profile, opp) -> float:
+    st = set(" ".join(profile.study_fields()).lower().split())
+    ot = set((opp.fields_of_study or [opp.degree_level or ""]).__str__().lower().split())
+    return min(1.0, len(st & ot) / max(1, len(st))) * 0.7 + 0.3
+
+
+def _fallback_rationale(status: str, margin: float | None) -> str:
+    m = f" GPA margin {margin:+.2f}." if margin is not None else ""
+    return f"Deterministic ranking (no LLM judgement). Status: {status}.{m}"

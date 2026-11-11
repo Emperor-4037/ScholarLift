@@ -3,17 +3,22 @@
 Stage 1 of the two-phase anti-hallucination pipeline (architecture §2.5).
 
 Normalization pipeline applied to BOTH the page text and the extracted span:
-  1. Unicode NFKC normalization
-  2. Case-folding (casefold, not just lower)
-  3. Quote unification (smart quotes → ASCII)
-  4. Dash unification (em/en dashes → ASCII hyphen)
-  5. Whitespace collapse (any run of whitespace → single space, stripped)
+  1. HTML entity unescaping (html.unescape)
+  2. Unicode NFKC normalization
+  3. Case-folding (casefold, not just lower)
+  4. Markdown link stripping: [text](url) → text
+  5. Quote unification (smart quotes → ASCII)
+  6. Dash unification (em/en dashes → ASCII hyphen)
+  7. Markdown formatting symbols stripped ([*_`~#>|]+)
+  8. Zero-width / invisible chars stripped
+  9. Whitespace collapse (any run of whitespace → single space, stripped)
 
 The normalized span must be a substring of the normalized page text,
 with length between 15 and 400 characters.
 """
 from __future__ import annotations
 
+import html
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -38,6 +43,17 @@ _DASH_PATTERN: re.Pattern[str] = re.compile(
 
 _WHITESPACE_PATTERN: re.Pattern[str] = re.compile(r"\s+")
 
+# Markdown link: [link text](url) → keep only link text
+_MD_LINK_PATTERN: re.Pattern[str] = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+
+# Markdown formatting symbols to strip (stand-alone, not inside words)
+_MD_FORMAT_PATTERN: re.Pattern[str] = re.compile(r"[*_`~#>|]+")
+
+# Zero-width and invisible Unicode characters
+_ZW_PATTERN: re.Pattern[str] = re.compile(
+    r"[\u200b\u200c\u200d\u00ad\ufeff]"
+)
+
 
 # ── Core normalizer ───────────────────────────────────────────────────────────
 
@@ -46,16 +62,24 @@ def normalize_text(text: str) -> str:
 
     Idempotent: normalize_text(normalize_text(t)) == normalize_text(t).
     """
-    # 1. NFKC — compatibility decomposition followed by canonical composition
+    # 1. HTML entity unescaping — catches &amp;, &nbsp;, etc.
+    text = html.unescape(text)
+    # 2. NFKC — compatibility decomposition followed by canonical composition
     text = unicodedata.normalize("NFKC", text)
-    # 2. Case-fold
+    # 3. Case-fold
     text = text.casefold()
-    # 3. Quote unification
+    # 4. Markdown link stripping: [text](url) → text
+    text = _MD_LINK_PATTERN.sub(r"\1", text)
+    # 5. Quote unification
     for char, replacement in _QUOTE_TABLE.items():
         text = text.replace(char, replacement)
-    # 4. Dash unification
+    # 6. Dash unification
     text = _DASH_PATTERN.sub("-", text)
-    # 5. Whitespace collapse
+    # 7. Strip Markdown formatting symbols
+    text = _MD_FORMAT_PATTERN.sub(" ", text)
+    # 8. Strip zero-width / invisible chars
+    text = _ZW_PATTERN.sub("", text)
+    # 9. Whitespace collapse
     text = _WHITESPACE_PATTERN.sub(" ", text).strip()
     return text
 
@@ -84,6 +108,7 @@ def verify_span(
     page_text: str,
     min_len: int = 15,
     max_len: int = 400,
+    fuzzy: bool = False,
 ) -> SpanVerificationResult:
     """Verify that *span* is a normalized substring of *page_text*.
 
@@ -92,6 +117,7 @@ def verify_span(
         page_text: The raw page text fetched by the Auditor.
         min_len:   Minimum length after normalization (default 15).
         max_len:   Maximum length after normalization (default 400).
+        fuzzy:     If True, attempt fuzzy matching when exact match fails (default False).
 
     Returns:
         SpanVerificationResult with matched status, offset, context window,
@@ -112,15 +138,47 @@ def verify_span(
         )
 
     offset = norm_page.find(norm_span)
-    if offset == -1:
+    if offset != -1:
+        context = extract_context_window(norm_page, offset, len(norm_span))
         return SpanVerificationResult(
-            matched=False,
-            failure_reason="Span not found in normalized page text",
+            matched=True,
+            offset=offset,
+            context_window=context,
         )
 
-    context = extract_context_window(norm_page, offset, len(norm_span))
+    # Fuzzy matching attempt if enabled
+    if fuzzy:
+        # Try to find a substring that matches at least 80% of the span
+        min_match_ratio = 0.8
+        best_match_ratio = 0.0
+        best_offset = -1
+        
+        # Search for partial matches using sliding window
+        span_len = len(norm_span)
+        for i in range(len(norm_page) - span_len + 1):
+            window = norm_page[i:i + span_len]
+            matches = sum(1 for a, b in zip(window, norm_span) if a == b)
+            ratio = matches / span_len
+            if ratio > best_match_ratio:
+                best_match_ratio = ratio
+                best_offset = i
+            if ratio == 1.0:  # Perfect match found
+                break
+        
+        if best_match_ratio >= min_match_ratio:
+            context = extract_context_window(norm_page, best_offset, span_len)
+            return SpanVerificationResult(
+                matched=True,
+                offset=best_offset,
+                context_window=context,
+            )
+        
+        return SpanVerificationResult(
+            matched=False,
+            failure_reason=f"Fuzzy match failed: best match ratio {best_match_ratio:.2f} < {min_match_ratio}",
+        )
+
     return SpanVerificationResult(
-        matched=True,
-        offset=offset,
-        context_window=context,
+        matched=False,
+        failure_reason="Span not found in normalized page text",
     )

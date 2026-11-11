@@ -8,7 +8,7 @@ PII scrubbing happens AFTER OCR extraction, not before (cannot scrub images).
 """
 from __future__ import annotations
 
-import base64
+import asyncio
 import logging
 from typing import Any, Callable
 
@@ -55,21 +55,12 @@ class VisionOCRAdapter:
         """
         logger.debug("OCR: Processing page %d (%d bytes)", page_num, len(image_bytes))
 
-        # Convert image to base64
-        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
-
         # Build task spec with image
         task = TaskSpec(
             tier=LLMTier.VISION,
-            instruction=_OCR_PROMPT,
-            data_blocks=[
-                {
-                    "type": "image",
-                    "data": image_b64,
-                    "mime_type": "image/png",
-                }
-            ],
-            output_schema=None,
+            system="You are a precise OCR engine.",
+            prompt=_OCR_PROMPT,
+            images=[image_bytes],
             max_output_tokens=4096,
             temperature=0.1,  # Low temperature for deterministic OCR
         )
@@ -113,17 +104,19 @@ class VisionOCRAdapter:
 
         results: dict[int, str] = {}
 
-        # Render pages to images and OCR in parallel
-        import asyncio
+        # Semaphore limits concurrent Vision-API calls to 4 (Phase 3D)
+        _ocr_sem = asyncio.Semaphore(4)
 
+        # Render pages to images and OCR in parallel
         async def process_page(page_idx: int) -> tuple[int, str]:
-            try:
-                image_bytes: bytes = await asyncio.to_thread(render_fn, pdf_bytes, page_idx)
-                text = await self.ocr_page(image_bytes, page_idx + 1)
-                return page_idx + 1, text  # Return 1-indexed page number
-            except Exception as exc:
-                logger.warning("OCR: Failed to render/OCR page %d: %s", page_idx + 1, exc)
-                return page_idx + 1, ""
+            async with _ocr_sem:
+                try:
+                    image_bytes: bytes = await asyncio.to_thread(render_fn, pdf_bytes, page_idx)
+                    text = await self.ocr_page(image_bytes, page_idx + 1)
+                    return page_idx + 1, text  # Return 1-indexed page number
+                except Exception as exc:
+                    logger.warning("OCR: Failed to render/OCR page %d: %s", page_idx + 1, exc)
+                    return page_idx + 1, ""
 
         tasks = [process_page(idx) for idx in pages_to_ocr]
         ocr_results = await asyncio.gather(*tasks, return_exceptions=True)

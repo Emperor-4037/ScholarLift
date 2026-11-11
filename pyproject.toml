@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "scholarship-finder"
-version = "0.1.0"
-description = "Autonomous Multi-Agent AI Scholarship Finder — TetraNoodle AI Hackathon 2026"
+version = "0.2.0"
+description = "ScholarLift — autonomous multi-agent scholarship finder (TetraNoodle AI Hackathon 2026)"
 requires-python = ">=3.12"
 license = { text = "MIT" }
 dependencies = [
@@ -14,30 +14,29 @@ dependencies = [
     "langgraph>=0.3",
     "pymupdf>=1.25",
     "pypdf>=5.0",
+    "python-docx>=1.1",
     "httpx>=0.28",
     "google-genai>=1.0",
     "openai>=1.50",
     "tavily-python>=0.5",
     "python-dotenv>=1.0",
-    "trafilatura>=1.12",          # local main-content extraction (Tier 2 fetch)
-    "fastapi>=0.115",              # SSE transport
+    "python-dateutil>=2.9",
+    "trafilatura>=1.12",          # local main-content extraction
+    "fastapi>=0.115",
+    "python-multipart>=0.0.9",    # multipart form uploads
     "uvicorn[standard]>=0.32",
-    "aiofiles>=24.1",
     "anyio>=4.6",
-    "jinja2>=3.1.0",              # HTML templates for FastAPI UI
-    "json-repair>=0.30",          # Robust LLM JSON output repair
+    "jinja2>=3.1.0",
+    "json-repair>=0.30",          # robust LLM JSON repair
 ]
 
 [project.scripts]
 scholarship-run = "scholarship_finder.cli:main"
-scholarship-preflight = "scholarship_finder.preflight:__main__"
+scholarship-preflight = "scholarship_finder.preflight:main"
 
 [project.optional-dependencies]
 full = [
-    "playwright>=1.49",           # Tier-3 headless browser (FULL profile only)
-]
-ocr = [
-    "pillow>=10.0.0",            # Image processing for OCR (optional, pymupdf has built-in rendering)
+    "playwright>=1.49",           # headless browser fetch tier (FULL profile only)
 ]
 dev = [
     "pytest>=8.0",
@@ -49,6 +48,9 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+scholarship_finder = ["web/templates/*.html", "web/static/**/*", "samples/*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

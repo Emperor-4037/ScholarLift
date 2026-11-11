@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from scholarship_finder.domain.models import CandidateProfile, Education, NormalizedGPA
+from scholarship_finder.domain.models import CandidateProfile, Education
 
 
 @dataclass
@@ -100,10 +100,11 @@ def _analyze_education(education: list[Education]) -> list[EnrichmentTip]:
     edu_with_normalized = [e for e in education if e.normalized_gpa is not None]
     low_gpa_edu = [e for e in edu_with_normalized if e.normalized_gpa.value < 2.5]
     if low_gpa_edu:
+        first_edu = low_gpa_edu[0]
         tips.append(EnrichmentTip(
             category="education",
             severity="medium",
-            message=f"Your GPA ({low_gpa_edu[0].normalized_gpa.value:.2f} on {low_gpa_edu[0].normalized_gpa.target_scale}) may limit options",
+            message=f"Your GPA ({first_edu.normalized_gpa.value:.2f} on {first_edu.normalized_gpa.target_scale}) may limit options",
             context="Many competitive scholarships require GPA > 3.0 (US scale). Focus on projects and research experience.",
             priority=6,
         ))
@@ -226,7 +227,6 @@ def _analyze_language_tests(language_tests: list[Any]) -> list[EnrichmentTip]:
         return tips
 
     # Check for low scores
-    test_names = ["ielts", "toefl"]
     low_score_tests = []
     for lt in language_tests:
         if lt.overall_score is not None:

@@ -11,9 +11,12 @@ Or as a library:
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 import time
 from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -34,9 +37,11 @@ class PreflightReport:
         return all(c.ok for c in self.checks)
 
     def critical_ok(self) -> bool:
-        """Core providers (LLM + Search) must pass for the system to work."""
-        critical = [c for c in self.checks if c.name in ("LLM (Gemini)", "Search (Tavily)")]
-        return all(c.ok for c in critical)
+        """At least one LLM model plus at least one working search provider."""
+        llm = [c for c in self.checks if ":" in c.name or c.name == "LLM"]
+        search = [c for c in self.checks if c.name.startswith("Search (")]
+        llm_ok = bool(llm) and any(c.ok for c in llm)
+        return llm_ok and any(c.ok for c in search) if search else llm_ok
 
     def summary(self) -> str:
         lines = [f"Pre-flight check ({self.elapsed_s:.1f}s):"]
@@ -56,10 +61,10 @@ async def run_preflight(settings=None) -> PreflightReport:
     start = time.perf_counter()
 
     checks = await asyncio.gather(
-        _check_llm_gemini(cfg),
-        _check_llm_groq(cfg),
+        _check_all_models(cfg),
         _check_search_tavily(cfg),
         _check_search_jina(cfg),
+        _check_jina_reader(cfg),
         _check_fetch(cfg),
         _check_github(cfg),
         return_exceptions=True,
@@ -68,6 +73,8 @@ async def run_preflight(settings=None) -> PreflightReport:
     for result in checks:
         if isinstance(result, Exception):
             report.checks.append(ProviderCheck(name="unknown", ok=False, detail=str(result)))
+        elif isinstance(result, list):
+            report.checks.extend(result)
         elif isinstance(result, ProviderCheck):
             report.checks.append(result)
         else:
@@ -79,63 +86,70 @@ async def run_preflight(settings=None) -> PreflightReport:
 
 # ── Individual provider checks ────────────────────────────────────────────────
 
-async def _check_llm_gemini(cfg) -> ProviderCheck:
-    key = getattr(cfg, "gemini_api_key", None)
-    if not key:
-        return ProviderCheck("LLM (Gemini)", ok=False, detail="No GEMINI_API_KEY set",
-                             warning="will use stub")
-    t0 = time.perf_counter()
-    try:
-        from scholarship_finder.adapters.llm_gemini import GeminiLLMAdapter
-        from scholarship_finder.ports.llm import TaskSpec, LLMTier
-        adapter = GeminiLLMAdapter(api_key=key, settings=cfg)
-        result = await asyncio.wait_for(
-            adapter.complete(TaskSpec(
-                tier=LLMTier.FAST,
-                instruction="Reply with the word PONG only.",
-                data_blocks=[],
-                max_output_tokens=50,
-            )),
-            timeout=18.0,
-        )
-        ms = (time.perf_counter() - t0) * 1000
-        return ProviderCheck("LLM (Gemini)", ok=True,
-                             detail=f"model={result.model}",
-                             latency_ms=ms)
-    except Exception as exc:
-        ms = (time.perf_counter() - t0) * 1000
-        return ProviderCheck("LLM (Gemini)", ok=False,
-                             detail=str(exc)[:80], latency_ms=ms)
+async def _check_all_models(cfg) -> list[ProviderCheck]:
+    """One tiny generate() per configured model in each chain."""
+    out: list[ProviderCheck] = []
+    providers: dict[str, object] = {}
+    groq_key = getattr(cfg, "groq_api_key", None)
+    if groq_key:
+        from scholarship_finder.adapters.llm_openai import OpenAICompatProvider
+        providers["groq"] = OpenAICompatProvider(
+            name="groq", api_key=groq_key,
+            base_url=getattr(cfg, "groq_api_base_url", "") or "https://api.groq.com/openai/v1")
+    openai_key = getattr(cfg, "openai_api_key", None)
+    if openai_key:
+        from scholarship_finder.adapters.llm_openai import OpenAICompatProvider
+        providers["openai"] = OpenAICompatProvider(
+            name="openai", api_key=openai_key,
+            base_url=getattr(cfg, "openai_api_base_url", "") or "")
+    gemini_key = getattr(cfg, "gemini_api_key", None)
+    if gemini_key:
+        from scholarship_finder.adapters.llm_gemini import GeminiProvider
+        providers["gemini"] = GeminiProvider(api_key=gemini_key)
+    if not providers:
+        return [ProviderCheck("LLM", ok=False,
+                              detail="No LLM keys configured", warning="will use stub")]
 
-
-async def _check_llm_groq(cfg) -> ProviderCheck:
-    key = getattr(cfg, "groq_api_key", None) or getattr(cfg, "openai_api_key", None)
-    if not key:
-        return ProviderCheck("LLM Failover (Groq)", ok=False, detail="No GROQ_API_KEY set",
-                             warning="optional failover")
-    t0 = time.perf_counter()
-    try:
-        from scholarship_finder.adapters.llm_openai import OpenAILLMAdapter
-        from scholarship_finder.ports.llm import TaskSpec, LLMTier
-        adapter = OpenAILLMAdapter(api_key=key, settings=cfg)
-        result = await asyncio.wait_for(
-            adapter.complete(TaskSpec(
-                tier=LLMTier.FAST,
-                instruction="Reply with the word PONG only.",
-                data_blocks=[],
-                max_output_tokens=50,
-            )),
-            timeout=15.0,
-        )
-        ms = (time.perf_counter() - t0) * 1000
-        return ProviderCheck("LLM Failover (Groq)", ok=True,
-                             detail=f"model={result.model}",
-                             latency_ms=ms)
-    except Exception as exc:
-        ms = (time.perf_counter() - t0) * 1000
-        return ProviderCheck("LLM Failover (Groq)", ok=False,
-                             detail=str(exc)[:80], latency_ms=ms,
-                             warning="failover offline")
+    chains = {
+        "fast": cfg.fast_models(), "reasoning": cfg.reasoning_models(),
+        "vision": cfg.vision_models(),
+    }
+    seen: set[str] = set()
+    for chain_name, models in chains.items():
+        for model in models:
+            if model in seen:
+                continue
+            seen.add(model)
+            if "gemini" in model:
+                pname = "gemini"
+            elif "groq" in providers:
+                pname = "groq"
+            elif "openai" in providers:
+                pname = "openai"
+            else:
+                pname = "gemini" if "gemini" in providers else next(iter(providers))
+            provider = providers.get(pname)
+            if provider is None:
+                out.append(ProviderCheck(f"{chain_name}:{model}", ok=False,
+                                       detail=f"no {pname} provider", warning="chain gap"))
+                continue
+            model_id = model
+            t0 = time.perf_counter()
+            try:
+                from scholarship_finder.ports.llm import LLMTier, TaskSpec
+                await asyncio.wait_for(
+                    provider.generate(model_id, TaskSpec(
+                        tier=LLMTier.FAST, system="Reply with the word PONG only.",
+                        max_output_tokens=16)),
+                    timeout=20.0)
+                ms = (time.perf_counter() - t0) * 1000
+                out.append(ProviderCheck(f"{chain_name}:{model}", ok=True,
+                                         detail=f"{pname}", latency_ms=ms))
+            except Exception as exc:
+                ms = (time.perf_counter() - t0) * 1000
+                out.append(ProviderCheck(f"{chain_name}:{model}", ok=False,
+                                         detail=str(exc)[:90], latency_ms=ms))
+    return out
 
 
 async def _check_search_tavily(cfg) -> ProviderCheck:
@@ -166,24 +180,47 @@ async def _check_search_jina(cfg) -> ProviderCheck:
     key = getattr(cfg, "jina_api_key", None)
     if not key:
         return ProviderCheck("Search (Jina)", ok=False,
-                             detail="No JINA_API_KEY set", warning="secondary only")
+                             detail="No JINA_API_KEY set", warning="optional")
     t0 = time.perf_counter()
     try:
         from scholarship_finder.adapters.search_jina import JinaSearchAdapter
         from scholarship_finder.ports.search import SearchQuery
-        adapter = JinaSearchAdapter(api_key=key)
         result = await asyncio.wait_for(
-            adapter.search(SearchQuery(text="scholarship", max_results=1)),
-            timeout=10.0,
+            JinaSearchAdapter(api_key=key).search(
+                SearchQuery(text="DAAD scholarship international students", max_results=3)),
+            timeout=30.0,
         )
         ms = (time.perf_counter() - t0) * 1000
-        return ProviderCheck("Search (Jina)", ok=True,
+        return ProviderCheck("Search (Jina)", ok=bool(result.items),
                              detail=f"{len(result.items)} results", latency_ms=ms)
     except Exception as exc:
         ms = (time.perf_counter() - t0) * 1000
         return ProviderCheck("Search (Jina)", ok=False,
+                             detail=str(exc)[:80], latency_ms=ms)
+
+
+async def _check_jina_reader(cfg) -> ProviderCheck:
+    key = (getattr(cfg, "effective_jina_reader_key", lambda: "")()
+           or getattr(cfg, "jina_api_key", None))
+    if not key:
+        return ProviderCheck("Jina reader", ok=False,
+                             detail="No JINA key set", warning="tier-1 fetch fallback only")
+    t0 = time.perf_counter()
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(
+                "https://r.jina.ai/http%3A%2F%2Fexample.com",
+                headers={"Authorization": f"Bearer {key}"})
+        ms = (time.perf_counter() - t0) * 1000
+        ok = resp.status_code == 200 and len(resp.text) > 50
+        return ProviderCheck("Jina reader", ok=ok,
+                             detail=f"HTTP {resp.status_code}", latency_ms=ms)
+    except Exception as exc:
+        ms = (time.perf_counter() - t0) * 1000
+        return ProviderCheck("Jina reader", ok=False,
                              detail=str(exc)[:80], latency_ms=ms,
-                             warning="secondary only")
+                             warning="tier-1 fallback only")
 
 
 async def _check_fetch(cfg) -> ProviderCheck:
@@ -233,7 +270,8 @@ async def _check_github(cfg) -> ProviderCheck:
 
 # ── CLI entrypoint ────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
+def main() -> None:
+    """Console entry point (``scholarship-preflight`` / ``python -m …preflight``)."""
     if hasattr(sys.stdout, "reconfigure"):
         try:
             sys.stdout.reconfigure(encoding="utf-8")
@@ -243,7 +281,10 @@ if __name__ == "__main__":
     try:
         print(report.summary())
     except UnicodeEncodeError:
-        # Fallback for terminals that cannot handle unicode emojis
         plain_summary = report.summary().replace("✅", "[OK]").replace("❌", "[FAIL]")
         print(plain_summary)
     sys.exit(0 if report.critical_ok() else 1)
+
+
+if __name__ == "__main__":
+    main()

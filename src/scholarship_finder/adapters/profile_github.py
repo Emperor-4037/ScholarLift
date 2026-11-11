@@ -6,7 +6,6 @@ All failures are non-blocking: the run continues without GitHub signals.
 """
 from __future__ import annotations
 
-import asyncio
 from typing import Any
 
 import httpx
@@ -46,7 +45,12 @@ class GitHubAdapter:
         self._headers = headers
         self._cache = cache
 
-    async def fetch_signals(self, query: ProfileSourceQuery) -> ProfileSignals:
+    async def fetch_signals(self, query: ProfileSourceQuery) -> ProfileSignals | None:
+        """Return public profile signals, or None when the handle doesn't exist.
+
+        All other failures propagate as mapped adapter errors; a 404 is
+        non-blocking (the run simply continues without GitHub signals).
+        """
         handle = query.handle.strip().lstrip("@")
 
         # Check cache first (Phase 1 optimization)
@@ -63,11 +67,18 @@ class GitHubAdapter:
             follow_redirects=True,
             limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),  # Connection pooling
         ) as client:
-            repos, languages, topics = await asyncio.gather(
-                self._fetch_repos(client, handle, query.max_repos),
-                asyncio.sleep(0),   # placeholder for parallel lang aggregation
-                asyncio.sleep(0),
-            )
+            try:
+                repos = await self._fetch_repos(client, handle, query.max_repos)
+            except NotFoundError:
+                return None   # unknown handle — non-blocking
+
+        # Keep owned, non-fork repos; rank by stars then recency.
+        repos = [r for r in repos if not r.get("fork")]
+        repos.sort(
+            key=lambda r: (r.get("stargazers_count", 0), r.get("updated_at", "")),
+            reverse=True,
+        )
+        repos = repos[: query.max_repos]
 
         # Aggregate languages and topics across repos
         lang_counts: dict[str, int] = {}

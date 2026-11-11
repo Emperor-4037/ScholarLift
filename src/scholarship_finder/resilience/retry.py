@@ -82,7 +82,7 @@ async def with_retry(
             await asyncio.sleep(_jitter(0.5))
             last_error = e
 
-        except SchemaViolationError as e:
+        except SchemaViolationError:
             if attempt >= 1:  # One repair attempt
                 raise
             # Schema repair: caller must handle; just re-raise after one pass

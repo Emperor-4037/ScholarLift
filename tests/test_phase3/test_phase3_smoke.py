@@ -19,28 +19,19 @@ from scholarship_finder.domain.models import (
     Event,
     EventKind,
     EventSeverity,
-    EvidenceRef,
     FieldStatus,
     FundingInfo,
     FundingLevel,
-    LLMTier,
     NormalizedGPA,
     Opportunity,
     OpportunityKind,
     Preferences,
-    RunBudgets,
-    RunDeadlines,
-    RunMeta,
-    RunOutcome,
-    RunPhase,
     SwarmState,
     TrustTier,
     VerificationResult,
 )
-from scholarship_finder.domain.pii import PIIVault
 from scholarship_finder.engine.event_bus import EventBus
 from scholarship_finder.engine.gateway import RunGateway, make_initial_state
-from scholarship_finder.ports.llm import LLMResult, LLMUsage
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -291,14 +282,12 @@ class TestIntakeService:
         ))
 
         intake = IntakeService(document_port=mock_doc_port, vault_ttl_seconds=900)
-        result, vault = await intake.process(
-            b"fake pdf bytes",
-            "resume.pdf",
-            "application/pdf",
+        bundle, vault = await intake.process_documents(
+            [(b"fake pdf bytes", "resume.pdf", "RESUME")],
             display_name="John Smith",
         )
-        assert "[CANDIDATE_NAME]" in result.scrubbed_text
-        assert "John Smith" not in result.scrubbed_text
+        assert "[CANDIDATE_NAME]" in bundle.documents[0].text
+        assert "John Smith" not in bundle.documents[0].text
         assert vault.vault_id is not None
 
     @pytest.mark.asyncio
@@ -309,10 +298,8 @@ class TestIntakeService:
         intake = IntakeService(document_port=mock_doc_port)
 
         with pytest.raises(ValueError, match="too large"):
-            await intake.process(
-                b"x" * (_MAX_FILE_BYTES + 1),
-                "big.pdf",
-                "application/pdf",
+            await intake.process_documents(
+                [(b"x" * (_MAX_FILE_BYTES + 1), "big.pdf", "OTHER")],
             )
 
     @pytest.mark.asyncio
@@ -323,7 +310,7 @@ class TestIntakeService:
         intake = IntakeService(document_port=mock_doc_port)
 
         with pytest.raises(ValueError, match="Unsupported file type"):
-            await intake.process(b"data", "file.exe", "application/octet-stream")
+            await intake.process_documents([(b"data", "file.exe", "OTHER")])
 
 
 # ── Composition smoke test ────────────────────────────────────────────────────

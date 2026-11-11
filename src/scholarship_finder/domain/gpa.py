@@ -123,7 +123,23 @@ def _passthrough(cgpa: float, scale: float, **_: object) -> GPAResult:
 
 # ── Public registry & API ─────────────────────────────────────────────────────
 
+def _linear_to_us(cgpa: float, scale: float, **_: object) -> GPAResult:
+    """Generic linear rescale for scales without a better-known mapping.
+
+    Approximation: ``cgpa / scale * 4``. Used for e.g. /5, /20, /4.3 scales —
+    flagged low confidence in the note.
+    """
+    return GPAResult(
+        value=cgpa / scale * 4.0,
+        target_scale="us_4point",
+        method="linear_rescale",
+        confidence=0.6,
+        note=f"linear rescale {cgpa:g}/{scale:g} → US 4.0 (approximation)",
+    )
+
+
 GPA_STRATEGY_REGISTRY: dict[str, object] = {
+    "linear_to_us": _linear_to_us,
     "bavarian": _bavarian,
     "indian_to_us": _indian_to_us,
     "percentage_to_us": _percentage_to_us,
@@ -159,7 +175,8 @@ def normalize_gpa(
     strategy_map: dict[str, str] = {
         "us_4point": "indian_to_us" if scale == 10.0 else
                      "percentage_to_us" if scale == 100.0 else
-                     "passthrough",
+                     "passthrough" if scale == 4.0 else
+                     "linear_to_us",
         "german_1to4": "bavarian",
         "passthrough": "passthrough",
     }

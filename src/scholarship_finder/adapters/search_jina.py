@@ -6,6 +6,7 @@ Also supports Serper as an alternative via the same adapter interface.
 """
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import httpx
@@ -25,40 +26,61 @@ PROVIDER_SERPER = "serper"
 _JINA_SEARCH_URL = "https://s.jina.ai/"
 _SERPER_URL = "https://google.serper.dev/search"
 
+_JINA_TIMEOUT_S = 25.0
+_JINA_MAX_SITES = 5
+_JINA_RETRY_STATUS = (429, 500, 502, 503, 504)
+
+
+def jina_sites(domains: list[str]) -> list[str]:
+    """Usable ``site`` filters: strip ``*.``, drop bare TLD labels, dedupe, cap."""
+    out: list[str] = []
+    for d in domains:
+        d = (d or "").strip().lower().split("://")[-1].split("/")[0]
+        if d.startswith("*."):
+            d = d[2:]
+        if d.startswith("www."):
+            d = d[4:]
+        if "." in d and d not in out:
+            out.append(d)
+    return out[:_JINA_MAX_SITES]
+
 
 class JinaSearchAdapter:
     """Secondary search via Jina Search API (s.jina.ai).
 
-    Returns Markdown-enriched results. Shares the Jina API key.
+    Returns Markdown-enriched results. Shares the Jina API key. Several
+    ``site`` filters may be sent at once (repeated param); latency is spiky
+    (2-20 s) so calls get a generous timeout and one retry.
     """
 
-    def __init__(self, api_key: str | None = None) -> None:
+    def __init__(self, api_key: str | None = None,
+                 transport: httpx.AsyncBaseTransport | None = None,
+                 timeout: float = _JINA_TIMEOUT_S,
+                 max_concurrency: int = 6) -> None:
         self._api_key = api_key or ""
+        self._transport = transport
+        self._timeout = timeout
+        self._max_concurrency = max_concurrency
+        self._sems: dict[asyncio.AbstractEventLoop, asyncio.Semaphore] = {}
         self._headers: dict[str, str] = {
             "Accept": "application/json",
             "X-Respond-With": "no-content",   # snippets only; save tokens
         }
-        if self._api_key:
+        if self._api_key and self._api_key.isascii():
             self._headers["Authorization"] = f"Bearer {self._api_key}"
 
-    async def search(self, query: SearchQuery) -> SearchResult:
-        params: dict[str, Any] = {"q": query.text, "count": query.max_results}
-        if query.include_domains:
-            params["site"] = query.include_domains[0]   # Jina supports one site filter
+    def _sem(self) -> asyncio.Semaphore:
+        loop = asyncio.get_running_loop()
+        sem = self._sems.get(loop)
+        if sem is None:
+            sem = self._sems[loop] = asyncio.Semaphore(self._max_concurrency)
+        return sem
 
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(
-                    _JINA_SEARCH_URL,
-                    params=params,
-                    headers=self._headers,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-        except httpx.HTTPStatusError as exc:
-            raise self._map_http_error(exc, PROVIDER_JINA) from exc
-        except Exception as exc:
-            raise UnknownAdapterError(PROVIDER_JINA, str(exc), exc) from exc
+    async def search(self, query: SearchQuery) -> SearchResult:
+        params: list[tuple[str, str]] = [("q", query.text), ("count", str(query.max_results))]
+        params += [("site", s) for s in jina_sites(query.include_domains)]
+        async with self._sem():
+            data = await self._get(params)
 
         items = [
             SearchResultItem(
@@ -66,13 +88,42 @@ class JinaSearchAdapter:
                 title=r.get("title", ""),
                 snippet=r.get("description", "") or r.get("content", ""),
             )
-            for r in data.get("data", [])
+            for r in data.get("data", []) if r.get("url")
         ]
         return SearchResult(items=items, credits_used=0, provider=PROVIDER_JINA, query_text=query.text)
 
+    async def _get(self, params: list[tuple[str, str]]) -> dict[str, Any]:
+        for attempt in (0, 1):
+            try:
+                async with httpx.AsyncClient(timeout=self._timeout,
+                                             transport=self._transport) as client:
+                    resp = await client.get(_JINA_SEARCH_URL, params=params,
+                                            headers=self._headers)
+                resp.raise_for_status()
+                return resp.json()
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                if status == 422 and "no search results" in exc.response.text.lower():
+                    return {"data": []}
+                if attempt == 0 and status in _JINA_RETRY_STATUS:
+                    try:
+                        wait = min(float(exc.response.headers.get("Retry-After", "")), 5.0)
+                    except ValueError:
+                        wait = 1.5
+                    await asyncio.sleep(wait)
+                    continue
+                raise self._map_http_error(exc, PROVIDER_JINA) from exc
+            except httpx.TransportError as exc:
+                if attempt == 0:
+                    continue
+                raise TransientError(PROVIDER_JINA, f"{type(exc).__name__}: {exc}") from exc
+            except Exception as exc:
+                raise UnknownAdapterError(PROVIDER_JINA, str(exc), exc) from exc
+        raise TransientError(PROVIDER_JINA, "retries exhausted")
+
     def capabilities(self) -> dict[str, Any]:
         return {
-            "native_domain_filter": False,
+            "native_domain_filter": True,
             "native_date_filter": False,
             "returns_page_content": False,
             "credit_cost_basic": 0,
@@ -85,11 +136,11 @@ class JinaSearchAdapter:
     def _map_http_error(exc: httpx.HTTPStatusError, provider: str) -> Exception:
         status = exc.response.status_code
         msg = str(exc)
-        if status == 401:
+        if status in (401, 403):
             return AuthError(provider, f"Invalid API key: {msg}")
         if status == 429:
             return RateLimitedError(provider, msg, RateLimitScope.MINUTE, 5.0)
-        if status in (500, 502, 503):
+        if status in (500, 502, 503, 504):
             return TransientError(provider, f"Server error {status}: {msg}")
         return UnknownAdapterError(provider, msg, exc)
 

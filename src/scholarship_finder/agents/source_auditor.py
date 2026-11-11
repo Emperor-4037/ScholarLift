@@ -1,793 +1,808 @@
-"""Agent 3: Source Auditor
+"""Agent 3: Source Auditor — verify candidates into real opportunities.
 
-Responsibilities (architecture §1.3, Agent 3, §2.5 Stage 1):
-- Wave-pipelined fetching (~6 URLs per wave) via FetchPort
-- Batched extraction (4–5 pages per LLM call) via LLM fast tier
-- Span verification: every extracted attribute verified against normalized page text
-  - Mismatches → attribute demoted to UNVERIFIED
-  - Drop raw page text after extraction (RAM guard)
-- Entity grounding: URL/domain must match institution name
-- Early stop at 10 existence-verified opportunities
-- Returns SwarmState with opportunities list populated
+Streaming per-candidate pipeline (one coroutine per candidate under a single
+semaphore, results kept as each finishes):
 
-DEC-1: fast tier for all batch extraction. No reasoning tier.
-Anti-hallucination Stage 1 enforced here.
+  KB check → page text (Tavily focused chunks → full page) → deterministic
+  pre-gate → single-page schema-constrained extraction (+ regex hints) →
+  build + span-verify → KB write
+
+* Every evidence quote is span-verified against the fetched page text.
+* Listing pages yield Leads and, one hop deep, their award links become new
+  candidates audited in the same pass (deterministic, no LLM).
+* The knowledge base (profile-independent facts only) lets later runs reuse
+  verified opportunities and skip known-bad pages without fetch or LLM.
+* Stops starting new work at the soft deadline and cuts outstanding work
+  when discovery time runs out; finished pages are always kept.
 """
 from __future__ import annotations
 
 import asyncio
-import json
+import hashlib
 import logging
-from datetime import datetime, timezone
+import re
+import time
+from dataclasses import dataclass, field
+from datetime import date
+from typing import Any
 
 from scholarship_finder.domain.models import (
     Candidate,
     DeadlineInfo,
-    Event,
-    EventKind,
-    EventSeverity,
+    EligibilityCriteria,
     EvidenceRef,
     FieldStatus,
     FundingInfo,
-    FundingLevel,
+    LanguageRequirement,
+    Lead,
     LLMTier,
     Opportunity,
     OpportunityField,
-    OpportunityKind,
     SwarmState,
+    TrustTier,
     VerificationResult,
 )
-from typing import TypedDict
-from scholarship_finder.domain.reducers import reduce_opportunities
+from scholarship_finder.domain.eligibility import degree_levels_of
+from scholarship_finder.domain.listing import award_links, is_listing
+from scholarship_finder.domain.pregate import pregate
+from scholarship_finder.domain.source_filters import is_news_or_report
+from scholarship_finder.domain.req_hints import extract_hints, hints_block
 from scholarship_finder.domain.span_verifier import verify_span
+from scholarship_finder.domain.url import extract_domain
+from scholarship_finder.engine.context import emit, soft_deadline_passed
+from scholarship_finder.engine import context as run_context
 from scholarship_finder.engine.event_bus import EventBus
 from scholarship_finder.ports.fetch import FetchPort
 from scholarship_finder.ports.llm import LLMPort, TaskSpec
 
 logger = logging.getLogger(__name__)
 
-_WAVE_SIZE = 10       # URLs fetched in parallel per wave (balanced for quality vs efficiency)
-_BATCH_SIZE = 5        # Pages per LLM extraction call (balanced for quality vs efficiency)
-_EARLY_STOP = 20       # Stop after this many verified opportunities (increased for better results)
-_MAX_WAVES = 4         # Hard cap on total waves (increased for better coverage)
-_RECURSIVE_DEPTH = 1  # Number of levels to follow links (reduced for token efficiency)
-_MAX_CONCURRENT_FETCHES = 6  # Conservative concurrency for Send API (Phase 2.1)
+_FUNDING_RE = re.compile(
+    r"scholarship|fellowship|stipend|funding|tuition.?waiver|bursar|"
+    r"stipendium|bourse|beca|beurs|assistantship|grant", re.I)
+_MIN_CONTENT = 200
+_EXCERPT = 3200
+_ONE_HOP_CAP = 10
+_TRUSTED = (TrustTier.OFFICIAL_INSTITUTION, TrustTier.RECOGNIZED_FUNDER)
+_KB_REJECT_OK = frozenset({"junk", "news_or_report", "too_short",
+                           "no_funding_terms", "not_verified"})
+_ONE_HOP_MIN_TIME = 45.0
+_ROUND_S = (70.0, 60.0)    # wall-clock cap per audit round (first pass, expansion pass)
+_FOCUS_QUERY = ("eligibility requirements who can apply nationality degree level "
+                "GPA language test funding amount covered costs deadline how to apply")
+
+_SYSTEM = """You extract facts from ONE web page about a scholarship/fellowship.
+Return ONE JSON object with these keys:
+is_specific_opportunity (true only if the page describes one specific funded award),
+is_listing_page (true if it mainly lists several different awards),
+listed_opportunity_names [str], name, provider, host_countries [str],
+degree_levels [str], fields_of_study [str],
+funding {coverage, amount_text, amount_value (number|null), currency, period, covers [str]},
+deadline {text, iso_date ("YYYY-MM-DD"|null)},
+eligibility {nationalities [str], nationality_text, open_to_international (bool|null),
+  degree_levels [str], fields_of_study [str], min_gpa_value (number|null),
+  min_gpa_scale (number|null), min_gpa_text,
+  language_requirements [{test, min_score, text}],
+  min_work_experience_months (int|null), max_age (int|null), other [str]},
+selection_criteria [str], how_to_apply, application_url,
+evidence {name, deadline, funding, eligibility} — each a sentence copied VERBATIM
+from the page (15-300 chars), or "" if the page has none.
+Only facts stated on the page. Use null/""/[] when absent. Never guess."""
+
+_S = {"type": "string"}
+_SA = {"type": "array", "items": {"type": "string"}}
+_NUM = {"type": ["number", "null"]}
+_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "is_specific_opportunity": {"type": "boolean"},
+        "is_listing_page": {"type": "boolean"},
+        "listed_opportunity_names": _SA,
+        "name": _S, "provider": _S,
+        "host_countries": _SA, "degree_levels": _SA, "fields_of_study": _SA,
+        "funding": {"type": "object", "properties": {
+            "coverage": _S, "amount_text": _S, "amount_value": _NUM,
+            "currency": _S, "period": _S, "covers": _SA}},
+        "deadline": {"type": "object", "properties": {
+            "text": _S, "iso_date": {"type": ["string", "null"]}}},
+        "eligibility": {"type": "object", "properties": {
+            "nationalities": _SA, "nationality_text": _S,
+            "open_to_international": {"type": ["boolean", "null"]},
+            "degree_levels": _SA, "fields_of_study": _SA,
+            "min_gpa_value": _NUM, "min_gpa_scale": _NUM, "min_gpa_text": _S,
+            "language_requirements": {"type": "array", "items": {
+                "type": "object", "properties": {
+                    "test": _S, "min_score": _NUM, "text": _S}}},
+            "min_work_experience_months": _NUM, "max_age": _NUM, "other": _SA}},
+        "selection_criteria": _SA, "how_to_apply": _S, "application_url": _S,
+        "evidence": {"type": "object", "properties": {
+            "name": _S, "deadline": _S, "funding": _S, "eligibility": _S}},
+    },
+    "required": ["is_specific_opportunity", "is_listing_page", "name", "evidence"],
+}
 
 
-# ── Mapper State for Send API (Phase 2.1) ─────────────────────────────────────
+@dataclass
+class _Run:
+    """Mutable per-invocation funnel state (single event loop, no locking needed)."""
+    state: SwarmState
+    kb: Any
+    target: int
+    opps: list[Opportunity]
+    leads: list[Lead]
+    verified: int = 0
+    kb_hits: int = 0
+    fetched: int = 0
+    pregated: int = 0
+    extracted: int = 0
+    one_hop: int = 0
+    weak: int = 0
+    levels: set = field(default_factory=set)
+    replay_listing: list = field(default_factory=list)
+    gate: dict[str, int] = field(default_factory=dict)
+    focused: dict[str, str] = field(default_factory=dict)
+    seen: set[str] = field(default_factory=set)
 
-class MapperState(TypedDict):
-    """State for a single candidate fetch/extract mapper node."""
-    candidate: Candidate
-    run_id: str
+    def count(self, reason: str) -> None:
+        self.gate[reason] = self.gate.get(reason, 0) + 1
 
-_EXTRACT_PROMPT = """\
-Extract structured opportunity data from the following web page excerpts.
+    def enough(self) -> bool:
+        return self.verified >= self.target + 4
 
-For each page, extract the following fields if present:
-- name: program/scholarship name
-- institution_or_funder: offering institution or funding body (LOOK CAREFULLY for university name, organization name, or funding body name)
-- country: host country or countries (LOOK for country names like Germany, Canada, USA, UK, etc.)
-- degree_level: e.g. masters, phd, bachelors, postdoc, undergraduate
-- funding_level: one of FULL_TUITION_STIPEND, FULL_TUITION, PARTIAL, NONE, UNKNOWN
-- funding_details: specific funding amount or description (stipend, tuition, etc.)
-- deadline: application deadline (date string or description)
-- eligibility: list of key eligibility requirements (citizenship, GPA, field of study, etc.)
-- requirements: list of any additional requirements (documents, tests, etc.)
-- kind: PROGRAM, SCHOLARSHIP, or PROGRAM_WITH_FUNDING
-- is_listing_page: boolean (true if this page lists multiple scholarships or is a database/directory, false if it describes ONE specific scholarship/program)
 
-Return ONLY valid JSON array (no markdown):
-[
-  {{
-    "page_index": <int>,
-    "name": "<string or null>",
-    "institution_or_funder": "<string or null>",
-    "country": "<string or null>",
-    "degree_level": "<string or null>",
-    "funding_level": "<string or null>",
-    "funding_details": "<string or null>",
-    "deadline": "<string or null>",
-    "eligibility": ["<string>", ...],
-    "requirements": ["<string>", ...],
-    "kind": "<string or null>",
-    "is_listing_page": <boolean>,
-    "evidence_spans": {{
-      "name": "<verbatim span from text, 15-400 chars or null>",
-      "institution_or_funder": "<verbatim span or null>",
-      "funding_level": "<verbatim span or null>",
-      "deadline": "<verbatim span or null>",
-      "country": "<verbatim span or null>",
-      "degree_level": "<verbatim span or null>"
-    }}
-  }},
-  ...
-]
+def _dtl() -> float:
+    ctx = run_context.current()
+    return ctx.discovery_time_left() if ctx is not None else float("inf")
 
-Rules:
-- Extract ONLY what is explicitly present in the page text.
-- Use null for any missing field.
-- evidence_spans must be verbatim substrings from the page text (case-sensitive).
-- CRITICAL: If evidence spans contain quotes, backslashes, or special characters, either:
-  1. Escape them properly using backslashes (\" for quotes, \\ for backslashes, \n for newlines), OR
-  2. Use a shorter, cleaner span that avoids special characters
-- If a page has no relevant content, include the entry with all fields null.
-- Pay special attention to eligibility criteria, citizenship requirements, and funding details.
-- CRITICAL: Look carefully for institution names, university names, and country names - these are often in headers, titles, or introductory text.
-- CRITICAL: For country, look for phrases like "in Germany", "Canada", "United States", "UK", "USA", etc.
-- CRITICAL: For funding, look for keywords like "fully funded", "stipend", "tuition waiver", "financial aid", "scholarship", "fellowship", "grant", "living allowance", "monthly stipend".
-- CRITICAL: If the page is a general degree program page with NO mention of funding, scholarships, or financial aid, set funding_level to "NONE" and mark it as not a scholarship opportunity.
-- Set kind to "SCHOLARSHIP" if the page mentions scholarships, funding, or financial aid. Set to "PROGRAM" only if it's a general degree page without funding.
-- CRITICAL: Determine if this page is a listing page (NOT a direct scholarship):
-  - Set is_listing_page = true if: page lists multiple scholarships, has search/filter features, is a scholarship database/directory, or contains generic text like "find scholarships", "scholarship database", "directory of scholarships"
-  - Set is_listing_page = false if: page describes ONE specific scholarship/program with specific eligibility, funding details, and application process
-  - Set is_listing_page = false if: page is from an official university (.edu) or government (.gov) domain describing their own scholarship program
-  - Examples of listing pages: "Scholarships & Resources for Data Science", "Find Scholarships", "Scholarship Database", "Graduate Programs Directory"
-  - Examples of direct pages: "DeepMind Scholarship 2026", "DAAD Scholarship Program", "University of XYZ Graduate Fellowship"
-- ENSURE VALID JSON: All strings must be properly escaped. The JSON must parse without errors.
-- For evidence_spans: Select clean, continuous text segments (15-400 chars) that avoid quotes, special characters, and line breaks. Prefer spans from single sentences or phrases.
 
-Pages:
-{pages_block}
-"""
+def _concurrency() -> int:
+    try:
+        from scholarship_finder.config import get_settings
+        return max(3, int(get_settings().local_llm_parallel) + 2)
+    except Exception:
+        return 3
+
+
+def _hash(text: str) -> str:
+    return hashlib.sha256((text or "").encode("utf-8", "ignore")).hexdigest()[:16]
+
+
+def _profile_tokens(profile: Any) -> set[str]:
+    if profile is None:
+        return set()
+    p = profile.preferences
+    words = " ".join([p.degree_level or "", *p.target_fields, *p.countries,
+                      profile.nationality or "",
+                      *(getattr(e, "field", "") or "" for e in profile.education)])
+    toks = set(re.findall(r"[a-z]{3,}", words.lower()))
+    lv = degree_levels_of(p.degree_level or "")
+    if "masters" in lv:
+        toks |= {"master", "masters", "msc", "postgraduate", "graduate"}
+    if "phd" in lv:
+        toks |= {"phd", "doctoral", "doctorate"}
+    if "bachelors" in lv:
+        toks |= {"bachelor", "bachelors", "undergraduate"}
+    return toks
 
 
 class SourceAuditorAgent:
-    """Agent 3: Fetches, extracts, and verifies opportunity data."""
-
     def __init__(self, llm_port: LLMPort, fetch_port: FetchPort) -> None:
         self._llm = llm_port
         self._fetch = fetch_port
 
-    def _clean_json_string(self, json_str: str) -> str:
-        """Clean and repair common JSON issues from LLM output."""
-        import re
+    async def run(self, state: SwarmState, bus: EventBus) -> dict:
+        from scholarship_finder.adapters.knowledge_base import get_kb
+        cands = [c for c in state.candidates if not c.audited
+                 and not is_junk_url(c.canonical_url or "")]
+        if not cands:
+            return {}
+        r = _Run(state=state, kb=get_kb(), target=_target(),
+                 opps=list(state.opportunities), leads=list(state.leads))
+        r.verified = sum(1 for o in r.opps if o.is_existence_verified())
+        r.seen = {c.canonical_url for c in state.candidates}
+        r.levels = _target_levels(state.profile)
+        await self._prefetch_focused(r, [c.canonical_url for c in cands])
 
-        # Remove control characters except \n, \r, \t
-        json_str = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', json_str)
+        sem = asyncio.Semaphore(_concurrency())
+        tasks: set[asyncio.Task] = set()
 
-        # Fix common issues with unterminated strings by removing trailing characters
-        # after the last complete value in the JSON
-        # Try to find the last complete object/array and truncate after it
-        lines = json_str.split('\n')
-        cleaned_lines = []
-        for line in lines:
-            # Remove trailing commas that would break JSON (at end of objects/arrays)
-            line = re.sub(r',\s*([}\]])', r'\1', line)
-            cleaned_lines.append(line)
-        json_str = '\n'.join(cleaned_lines)
+        def spawn(c: Candidate, depth: int) -> None:
+            tasks.add(asyncio.create_task(self._guarded(sem, r, c, depth, spawn)))
 
-        # Fix common quote escaping issues in evidence_spans
-        # This is a heuristic - if we detect unescaped quotes in string values, try to fix
-        # Note: This is a best-effort repair and may not handle all cases
-        return json_str
+        for c in cands:
+            spawn(c, 0)
+        t_end = time.monotonic() + _ROUND_S[min(state.run_meta.expansion_rounds, 1)]
+        while tasks:
+            if _dtl() <= 0 or time.monotonic() >= t_end:
+                break
+            done, _ = await asyncio.wait(
+                set(tasks), timeout=max(0.1, min(_dtl(), t_end - time.monotonic(), 5.0)),
+                return_when=asyncio.FIRST_COMPLETED)
+            tasks -= done
+            for t in done:
+                if not t.cancelled() and t.exception() is not None:
+                    logger.warning("auditor task failed: %r", t.exception())
+        if tasks:
+            emit("source_auditor",
+                 f"Audit time up — keeping finished pages, dropping {len(tasks)} slow page(s) in flight")
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
-    def _repair_json(self, raw: str) -> list | None:
-        """Attempt multiple JSON repair strategies, return parsed list or None."""
-        # Strategy 1: try json_repair library if available
-        try:
-            import json_repair  # type: ignore
-            repaired = json_repair.repair_json(raw)
-            result = json.loads(repaired)
-            if isinstance(result, list):
-                logger.info("JSON repair succeeded via json_repair library")
-                return result
-        except (ImportError, Exception):
-            pass
+        reasons = ("; " + ", ".join(f"{k} {v}" for k, v in sorted(r.gate.items()))
+                   if r.gate else "")
+        emit("source_auditor",
+             f"Audit funnel: {len(cands)} cands → {r.kb_hits} kb → {r.fetched} fetched → "
+             f"{r.pregated} pregated → {r.extracted} extracted → {r.verified} verified "
+             f"(+{r.weak} weak-source, {len(r.leads) - len(state.leads)} leads, "
+             f"{r.one_hop} one-hop){reasons}")
+        return {
+            "opportunities": _dedupe(r.opps),
+            "leads": _dedupe_leads(r.leads),
+            "candidates": state.candidates,
+        }
 
-        # Strategy 2: extract array brackets and retry
-        if '[' in raw and ']' in raw:
+    # ── per-candidate pipeline ──────────────────────────────────────────────
+    async def _guarded(self, sem, r: _Run, c: Candidate, depth: int, spawn) -> None:
+        async with sem:
+            if soft_deadline_passed() or r.enough() or _dtl() <= 0:
+                return
             try:
-                start = raw.find('[')
-                end = raw.rfind(']') + 1
-                candidate = raw[start:end]
-                result = json.loads(candidate)
-                if isinstance(result, list):
-                    logger.info("JSON repair succeeded via bracket extraction")
-                    return result
-            except Exception:
-                pass
+                await self._process(r, c, depth, spawn)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("auditor: %s failed: %r", c.canonical_url, exc, exc_info=True)
 
-        # Strategy 3: find the last complete JSON object using brace counting
+    async def _process(self, r: _Run, c: Candidate, depth: int, spawn) -> None:
+        url = c.canonical_url
+        c.audited = True
+        if r.kb is not None and self._kb_lookup(r, c):
+            if c in r.replay_listing and depth == 0:     # cached listing: re-derive its children
+                r.replay_listing.remove(c)
+                full = r.kb.get_page(url) or await self._page_text(c)
+                await self._one_hop(r, c, full, spawn)
+            return
+        text = _sanitize_page(r.focused.get(url) or await self._page_text(c))
+        if not text:
+            r.count("fetch_failed")          # transient — never cached
+            return
+        r.fetched += 1
+        h = _hash(text)
+        ok, reason = pregate(c, text, r.state.profile)
+        if not ok:
+            r.count(reason)
+            if r.kb is not None and reason in _KB_REJECT_OK:
+                r.kb.put_verdict(url, h, "rejected", reason=reason)
+            return
+        r.pregated += 1
+        hints = extract_hints(text)
+        item = await self._extract_one(c, text, hints)
+        if item is None:
+            r.count("llm_failed")            # transient — never cached
+            return
+        r.extracted += 1
+        listing = bool(item.get("is_listing_page")) and not item.get("is_specific_opportunity")
+        full = ""
+        if listing or not item.get("is_specific_opportunity"):
+            full = await self._page_text(c)
+            listing = listing or is_listing(full, url)
+        if listing:
+            names = [_clean_text(n.get("name", "") if isinstance(n, dict) else n)
+                     for n in (item.get("listed_opportunity_names") or [])
+                     if isinstance(n, (str, dict))][:10]
+            names = [n for n in names if _name_ok(n)]
+            r.leads += [Lead(name=n, source_url=url) for n in names]
+            if r.kb is not None:
+                r.kb.put_verdict(url, h, "listing", lead_names=names)
+            if depth == 0:
+                await self._one_hop(r, c, full, spawn)
+            return
+        if c.trust_tier == TrustTier.AGGREGATOR or is_news_or_report(url, c.title or ""):
+            r.count("aggregator_or_news")     # leads-only, never an opportunity
+            return
+        opp = None
         try:
-            brace_count = 0
-            last_complete_idx = -1
-            in_string = False
-            escape_next = False
-            for i, char in enumerate(raw):
-                if escape_next:
-                    escape_next = False
-                    continue
-                if char == '\\' and in_string:
-                    escape_next = True
-                    continue
-                if char == '"' and not escape_next:
-                    in_string = not in_string
-                if in_string:
-                    continue
-                if char == '{':
-                    brace_count += 1
-                elif char == '}':
-                    brace_count -= 1
-                    if brace_count == 0:
-                        last_complete_idx = i
+            opp = _build_opp(item, c, text, hints)
+        except Exception as exc:
+            logger.warning("auditor: build failed for %s: %r", url, exc)
+        if opp is not None and _off_level(opp, r.levels):
+            r.count("level_mismatch_extracted")   # student-specific: not cached as a verdict
+            if r.kb is not None and opp.is_existence_verified():
+                r.kb.put_opportunity(url, opp, h, c.trust_tier.value)
+            return
+        if opp is None or not opp.is_existence_verified():
+            if r.kb is not None:
+                r.kb.put_verdict(url, h, "rejected", reason="not_verified")
+            r.count("not_verified")
+            return
+        if r.kb is not None:
+            r.kb.put_opportunity(url, opp, h, c.trust_tier.value)
+        self._accept(r, opp)
 
-            if last_complete_idx > 0:
-                truncated = raw[:last_complete_idx + 1]
-                array_start = raw.find('[')
-                if array_start >= 0 and array_start < last_complete_idx:
-                    truncated = raw[array_start:last_complete_idx + 1]
-                    truncated = truncated.rstrip(',').rstrip()
-                    if not truncated.endswith(']'):
-                        truncated += ']'
-                else:
-                    truncated = '[' + truncated + ']'
-                result = json.loads(truncated)
-                if isinstance(result, list):
-                    logger.info("JSON repair succeeded via brace counting (recovered %d objects)", len(result))
-                    return result
-        except Exception:
-            pass
-
-        # Strategy 4: extract individual JSON objects one by one
-        try:
-            objects = []
-            depth = 0
-            start_idx = None
-            in_str = False
-            esc = False
-            for i, ch in enumerate(raw):
-                if esc:
-                    esc = False
-                    continue
-                if ch == '\\' and in_str:
-                    esc = True
-                    continue
-                if ch == '"':
-                    in_str = not in_str
-                if in_str:
-                    continue
-                if ch == '{':
-                    if depth == 0:
-                        start_idx = i
-                    depth += 1
-                elif ch == '}':
-                    depth -= 1
-                    if depth == 0 and start_idx is not None:
-                        obj_str = raw[start_idx:i + 1]
-                        try:
-                            obj = json.loads(obj_str)
-                            objects.append(obj)
-                        except Exception:
-                            pass
-                        start_idx = None
-            if objects:
-                logger.info("JSON repair succeeded via object-by-object extraction (%d objects)", len(objects))
-                return objects
-        except Exception:
-            pass
-
-        return None
-
-    def _is_listing_page(self, data: dict, page_text: str) -> bool:
-        """Detect if the page is a scholarship listing/aggregator page.
-        
-        Returns True if the page lists multiple scholarships or is a database/directory.
-        Returns False if the page describes a single specific scholarship/program.
-        """
-        name = data.get("name", "").lower()
-        institution = data.get("institution_or_funder", "").lower()
-        
-        # Check if LLM explicitly marked it as a listing page
-        if data.get("is_listing_page") == True:
-            logger.info("LLM classified as listing page: %s from %s", name, institution)
+    def _kb_lookup(self, r: _Run, c: Candidate) -> bool:
+        """True when the KB fully answered this candidate (no fetch/LLM needed)."""
+        url = c.canonical_url
+        cached = r.kb.get_opportunity(url)
+        if cached is not None:
+            r.kb_hits += 1
+            if _off_level(cached, r.levels):
+                r.count("level_mismatch_extracted")
+            else:
+                self._accept(r, cached, note="(cached)")
             return True
-        
-        # Check for listing keywords in name
-        listing_keywords = [
-            "scholarships & resources",
-            "find scholarships",
-            "scholarship database",
-            "scholarship finder",
-            "search scholarships",
-            "online master's degrees",
-            "masters portal",
-            "phd portal",
-            "find a masters",
-            "find a phd",
-            "scholarship positions",
-        ]
-        
-        # Check name for listing indicators
-        for kw in listing_keywords:
-            if kw in name:
-                logger.info("Name contains listing keyword '%s': %s", kw, name)
-                return True
-        
-        # Check institution for generic/indicators
-        generic_institutions = [
-            "online master's degrees",
-            "scholarship finder",
-            "study portal",
-            "masters portal",
-            "phd portal",
-            "studyportals",
-            "youth opportunities",
-            "opportunity desk"
-        ]
-        
-        for gen in generic_institutions:
-            if gen in institution:
-                logger.info("Institution is generic '%s': %s", gen, institution)
-                return True
-        
-        # Check if name is very generic without specific program name
-        # E.g., "Scholarships" vs "DeepMind Scholarship 2026"
-        if name in ["scholarships", "funding", "graduate funding", "scholarship"]:
-            logger.info("Name is too generic: %s", name)
+        v = r.kb.get_verdict(url)
+        if not v:
+            return False
+        r.kb_hits += 1
+        if v.get("verdict") == "listing":
+            r.leads += [Lead(name=n, source_url=url) for n in (v.get("lead_names") or [])[:10]]
+            r.replay_listing.append(c)
             return True
-        
+        if v.get("verdict") == "rejected":
+            r.count("kb_rejected")
+            return True
         return False
 
-    # ── Mapper function for Send API (Phase 2.1) ───────────────────────────────
-
-    async def fetch_and_verify_candidate(
-        self, mapper_state: MapperState, bus: EventBus
-    ) -> dict:
-        """Mapper node: fetch and verify a single candidate (for Send API).
-
-        Returns a dict with verified opportunities list.
-        """
-        raw = mapper_state["candidate"]
-        candidate = raw if isinstance(raw, Candidate) else Candidate.model_validate(raw)
-        run_id = mapper_state["run_id"]
-
-        try:
-            # Fetch the candidate's page
-            page_text, _ = await self._fetch_one(candidate)
-
-            if not page_text:
-                return {"verified_opps": []}
-
-            # Extract and verify (batch size of 1 for mapper)
-            batch = [(candidate, page_text)]
-            opportunities = await self._extract_and_verify_batch(batch, [])
-
-            return {"verified_opps": opportunities}
-
-        except Exception as exc:
-            logger.warning("Mapper failed for %s: %s", getattr(candidate, "canonical_url", "?"), exc)
-            return {"verified_opps": []}
-
-    async def run(self, state: SwarmState, bus: EventBus) -> SwarmState:
-        """Audit candidates to build a verified Opportunity list."""
-        run_id = state.run_meta.run_id
-        candidates = state.candidates
-
-        if not candidates:
-            logger.warning("SourceAuditor: no candidates to audit")
-            return state
-
-        await bus.publish(Event(
-            run_id=run_id,
-            seq=0,
-            timestamp=datetime.now(timezone.utc),
-            node="source_auditor",
-            severity=EventSeverity.INFO,
-            kind=EventKind.NODE_STARTED,
-            payload={"node": "source_auditor", "candidate_count": len(candidates)},
-        ))
-
-        verified_opps: list[Opportunity] = []
-        new_state = state.model_copy(deep=True)
-
-        # Process in waves
-        for wave_idx in range(min(_MAX_WAVES, (len(candidates) + _WAVE_SIZE - 1) // _WAVE_SIZE)):
-            if len(verified_opps) >= _EARLY_STOP:
-                logger.info("SourceAuditor: early stop at %d verified opps", len(verified_opps))
-                break
-
-            wave_start = wave_idx * _WAVE_SIZE
-            wave = candidates[wave_start: wave_start + _WAVE_SIZE]
-
-            # Fetch wave in parallel
-            fetch_results = await self._fetch_wave(wave, run_id)
-
-            # Batch extraction (4–5 per call)
-            for batch_start in range(0, len(fetch_results), _BATCH_SIZE):
-                batch = fetch_results[batch_start: batch_start + _BATCH_SIZE]
-                batch_opps = await self._extract_and_verify_batch(batch, wave)
-                verified_opps.extend(batch_opps)
-
-                if len(verified_opps) >= _EARLY_STOP:
-                    break
-
-            await bus.publish(Event(
-                run_id=run_id,
-                seq=0,
-                timestamp=datetime.now(timezone.utc),
-                node="source_auditor",
-                severity=EventSeverity.INFO,
-                kind=EventKind.PROGRESS,
-                payload={
-                    "wave": wave_idx + 1,
-                    "verified_so_far": len(verified_opps),
-                },
-            ))
-
-        # Merge into state
-        new_state.opportunities = reduce_opportunities(state.opportunities, verified_opps)
-
-        await bus.publish(Event(
-            run_id=run_id,
-            seq=0,
-            timestamp=datetime.now(timezone.utc),
-            node="source_auditor",
-            severity=EventSeverity.INFO,
-            kind=EventKind.NODE_COMPLETED,
-            payload={
-                "node": "source_auditor",
-                "opportunities_found": len(new_state.opportunities),
-                "early_stopped": len(verified_opps) >= _EARLY_STOP,
-            },
-        ))
-
-        return new_state
-
-    # ── Private helpers ───────────────────────────────────────────────────────
-
-    async def _fetch_wave(
-        self, wave: list[Candidate], run_id: str, depth: int = 0
-    ) -> list[tuple[Candidate, str | None]]:
-        """Fetch a wave of URLs in parallel. Returns (candidate, text_or_none) pairs.
-        
-        If depth < _RECURSIVE_DEPTH, also fetch linked pages from listing pages.
-        """
-        tasks = [self._fetch_one(c) for c in wave]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        pairs: list[tuple[Candidate, str | None]] = []
-        additional_candidates: list[Candidate] = []
-        
-        for c, result in zip(wave, results):
-            if isinstance(result, Exception):
-                logger.debug("Fetch failed for %s: %s", c.canonical_url, result)
-                pairs.append((c, None))
-            else:
-                page_text, links = result
-                pairs.append((c, page_text))
-                
-                # If we found links and haven't reached max depth, queue them
-                if links and depth < _RECURSIVE_DEPTH:
-                    from urllib.parse import urlparse
-                    for link in links:
-                        parsed = urlparse(link)
-                        additional_candidates.append(Candidate(
-                            url=link,
-                            canonical_url=link,
-                            domain=parsed.netloc or "",
-                            kind_hint=c.kind_hint,
-                            trust_tier=c.trust_tier,
-                            source_query_id="recursive_link",
-                        ))
-        
-        # If we have additional candidates and haven't reached max depth, fetch them
-        if additional_candidates and depth < _RECURSIVE_DEPTH:
-            logger.info("SourceAuditor: fetching %d linked pages at depth %d", 
-                        len(additional_candidates), depth + 1)
-            recursive_pairs = await self._fetch_wave(additional_candidates, run_id, depth + 1)
-            pairs.extend(recursive_pairs)
-        
-        return pairs
-
-    async def _fetch_one(self, candidate: Candidate) -> tuple[str | None, list[str]]:
-        """Fetch a single URL and return (page_text, linked_urls) or (None, [])."""
-        try:
-            doc = await self._fetch.fetch(candidate.canonical_url)
-            if not doc:
-                return None, []
-            
-            # Extract links that look like actual scholarship pages
-            links = self._extract_relevant_links(doc.normalized_text, candidate.canonical_url)
-            return doc.normalized_text, links
-        except Exception as exc:
-            logger.debug("Fetch error for %s: %s", candidate.canonical_url, exc)
-            return None, []
-
-    def _extract_relevant_sections(self, page_text: str) -> str:
-        """Extract only relevant sections from page text to reduce token usage.
-
-        Looks for keywords related to scholarships, funding, deadlines, eligibility, etc.
-        and extracts paragraphs containing these keywords along with nearby context.
-        """
-        import re
-
-        # Keywords that indicate relevant sections
-        relevant_keywords = [
-            'scholarship', 'funding', 'financial aid', 'stipend', 'tuition',
-            'deadline', 'application', 'eligible', 'eligibility', 'requirement',
-            'program', 'degree', 'master', 'phd', 'bachelor', 'graduate',
-            'admission', 'apply', 'criteria', 'citizenship', 'gpa',
-            'ielts', 'toefl', 'language', 'english', 'cost', 'fee'
-        ]
-
-        # Split into paragraphs (by double newlines or period+newline)
-        paragraphs = re.split(r'\n\n+|\.\n', page_text)
-
-        relevant_paragraphs = []
-        for para in paragraphs:
-            para_lower = para.lower()
-            # Check if paragraph contains any relevant keyword
-            if any(kw in para_lower for kw in relevant_keywords):
-                relevant_paragraphs.append(para.strip())
-
-        # If we found relevant sections, use them; otherwise use first few paragraphs
-        if relevant_paragraphs:
-            extracted = '\n\n'.join(relevant_paragraphs[:20])  # Max 20 relevant paragraphs
+    def _accept(self, r: _Run, opp: Opportunity, note: str = "") -> None:
+        if _is_dup(opp, r.opps):
+            return
+        r.opps.append(opp)
+        if not opp.is_existence_verified():
+            return
+        if opp.verification.trust_tier in _TRUSTED:
+            r.verified += 1
+            emit("source_auditor",
+                 f"Verified {r.verified}/{r.target}: {opp.name} — "
+                 f"{extract_domain(opp.official_url)} {note}".rstrip(),
+                 verified=r.verified)
         else:
-            # Fallback: use first 10 paragraphs
-            extracted = '\n\n'.join(p.strip() for p in paragraphs[:10] if p.strip())
+            r.weak += 1
+            emit("source_auditor",
+                 f"Weak source (not counted): {opp.name} — {extract_domain(opp.official_url)}")
 
-        # Also extract headers/titles (lines that look like headers)
-        header_pattern = r'^(#{1,3}\s|<h[1-3]>|<strong>|[A-Z][A-Z\s]{5,}:)\s*.+$'
-        headers = re.findall(header_pattern, page_text, re.MULTILINE)
-        if headers:
-            header_text = '\n'.join(headers[:10])
-            extracted = header_text + '\n\n' + extracted
-
-        # Limit to 4000 characters (reasonable for extraction)
-        return extracted[:4000]
-
-    def _extract_relevant_links(self, page_text: str, base_url: str) -> list[str]:
-        """Extract URLs that look like actual scholarship/program pages from listing pages."""
-        import re
-        from urllib.parse import urljoin, urlparse
-        
-        # Pattern to find URLs
-        url_pattern = r'https?://[^\s<>"\'()]+'
-        urls = re.findall(url_pattern, page_text)
-        
-        # Filter URLs that look like actual program pages (not listing pages)
-        relevant_urls = []
-        for url in urls:
-            # Skip if it's the same as base URL
-            if url == base_url:
+    async def _one_hop(self, r: _Run, parent: Candidate, full: str, spawn) -> None:
+        if (parent.trust_tier not in _TRUSTED or r.one_hop >= _ONE_HOP_CAP
+                or _dtl() <= _ONE_HOP_MIN_TIME or not full):
+            return
+        links = award_links(full, parent.canonical_url, _profile_tokens(r.state.profile))
+        children = []
+        for name, link, _score in links:
+            if r.one_hop >= _ONE_HOP_CAP:
+                break
+            if link in r.seen:
                 continue
-            
-            # Skip if it looks like a listing/search page
-            skip_keywords = ['/search', '/browse', '/results']
-            if any(kw in url.lower() for kw in skip_keywords):
-                continue
-            
-            # Keep URLs that look like individual program pages
-            # Usually they contain program IDs, names, or are direct paths
-            parsed = urlparse(url)
-            path_lower = parsed.path.lower()
-            
-            # Skip very short paths (likely listing pages)
-            if len(parsed.path) < 3 and not parsed.query:
-                continue
-            
-            # Keep if path contains typical program page patterns
-            keep_keywords = ['program', 'scholarship', 'fellowship', 'grant', 'detail', 'view']
-            if any(kw in path_lower for kw in keep_keywords):
-                relevant_urls.append(url)
-            # Also keep if path is reasonably long (likely a specific page)
-            elif len(parsed.path) > 20:
-                relevant_urls.append(url)
-        
-        # Deduplicate and limit
-        return list(dict.fromkeys(relevant_urls))[:5]  # Max 5 links per page
+            r.seen.add(link)
+            r.one_hop += 1
+            children.append(Candidate(
+                url=link, canonical_url=link, domain=extract_domain(link),
+                trust_tier=parent.trust_tier, title=name, origin="listing",
+                country_hint=parent.country_hint, kind_hint=parent.kind_hint))
+        if not children:
+            return
+        emit("source_auditor",
+             f"Listing {extract_domain(parent.canonical_url)} → {len(children)} award pages")
+        r.state.candidates.extend(children)
+        await self._prefetch_focused(r, [ch.canonical_url for ch in children])
+        for ch in children:
+            spawn(ch, 1)
 
-    async def _extract_and_verify_batch(
-        self,
-        batch: list[tuple[Candidate, str | None]],
-        all_candidates: list[Candidate],
-    ) -> list[Opportunity]:
-        """Extract structured fields from a batch of pages, verify spans."""
-        # Build pages block — only include candidates with text
-        active = [(c, text) for c, text in batch if text]
-        if not active:
-            return []
-
-        pages_block = "\n\n".join(
-            f"=== Page {i} (URL: {c.canonical_url}) ===\n{self._extract_relevant_sections(text)}"
-            for i, (c, text) in enumerate(active)
-        )
-
-        task = TaskSpec(
-            tier=LLMTier.FAST,
-            instruction=_EXTRACT_PROMPT.format(pages_block=pages_block),
-            data_blocks=[],
-            output_schema=None,
-            max_output_tokens=2000,  # Reduced to match smaller input size
-        )
-
+    async def _prefetch_focused(self, r: _Run, urls: list[str]) -> None:
+        extractor = getattr(self._fetch, "_tavily", None) or getattr(self._fetch, "tavily", None)
+        if extractor is None or not hasattr(extractor, "extract_focused") or not urls:
+            return
+        chunks = [urls[i:i + 20] for i in range(0, min(len(urls), 60), 20)]
         try:
-            result = await self._llm.complete(task)
-            raw = result.content.strip()
-            
-            # Strip code fences
-            if raw.startswith("```"):
-                raw = raw.split("```")[1]
-                if raw.startswith("json"):
-                    raw = raw[4:]
-            
-            # Clean JSON string
-            raw = self._clean_json_string(raw)
-            
-            # Try to parse JSON directly first
+            results = await asyncio.wait_for(
+                asyncio.gather(*[extractor.extract_focused(u, _FOCUS_QUERY) for u in chunks],
+                               return_exceptions=True),
+                timeout=max(5.0, min(40.0, _dtl())))
+        except Exception:
+            return
+        for res in results:
+            if isinstance(res, dict):
+                r.focused.update(res)
+
+    async def _page_text(self, c: Candidate) -> str:
+        try:
+            doc = await self._fetch.fetch(c.canonical_url)
+            return doc.normalized_text or ""
+        except Exception:
+            return ""
+
+    async def _extract_one(self, c: Candidate, text: str, hints: dict) -> dict | None:
+        prompt = "\n".join(x for x in (
+            hints_block(hints), f"PAGE url={c.canonical_url} title={c.title or ''}",
+            _excerpt(text)) if x)
+        spec = TaskSpec(tier=LLMTier.FAST, system=_SYSTEM, prompt=prompt,
+                        json_mode=True, json_schema=_SCHEMA, max_output_tokens=800,
+                        temperature=0.1, purpose="audit_extract")
+        for attempt in (0, 1):
             try:
-                extracted = json.loads(raw)
-            except json.JSONDecodeError as json_err:
-                # Try to fix common JSON issues: unescaped quotes in strings
-                logger.warning("Initial JSON parse failed, attempting repair: %s", json_err)
-                extracted = self._repair_json(raw)
-                if extracted is None:
-                    logger.error("JSON repair failed: Could not find complete JSON structure")
-                    logger.debug("Problematic JSON (first 500 chars): %s", raw[:500])
-                    return []
-                    
-        except Exception as exc:
-            logger.warning("Extraction batch failed: %s", exc)
-            return []
-
-        opportunities: list[Opportunity] = []
-        for item in extracted:
-            idx = item.get("page_index", 0)
-            if idx >= len(active):
-                continue
-
-            candidate, page_text = active[idx]
-            opp = self._build_opportunity(item, candidate, page_text or "")
-            if opp is not None:
-                opportunities.append(opp)
-
-        return opportunities
-
-    def _build_opportunity(
-        self, data: dict, candidate: Candidate, page_text: str
-    ) -> Opportunity | None:
-        """Build a verified Opportunity from extracted data + span verification."""
-        import uuid
-
-        name = data.get("name")
-        if not name:
-            return None  # Can't build an opportunity without a name
-
-        # Filter out listing/aggregator pages (Phase 1 fix)
-        if self._is_listing_page(data, page_text):
-            logger.info("Filtering out listing page: %s", name)
-            return None
-
-        # Filter out general program pages with no funding
-        funding_level_str = data.get("funding_level", "").upper()
-        funding_details_str = data.get("funding_details") or ""
-        kind = data.get("kind", "").upper()
-
-        # Check if this page explicitly has NO funding (filter these out)
-        # Allow pages with UNKNOWN funding or partial funding mentions
-        has_explicit_no_funding = (
-            funding_level_str == "NONE"
-            and not any(kw in funding_details_str.lower() for kw in ["scholarship", "funding", "stipend", "financial aid", "tuition waiver"])
-            and kind != "SCHOLARSHIP"
-        )
-
-        # Skip only pages that explicitly have NO funding
-        if has_explicit_no_funding:
-            logger.debug("Skipping %s - explicitly marked as no funding", name)
-            return None
-
-        evidence_spans = data.get("evidence_spans", {}) or {}
-        fetched_at = datetime.now(timezone.utc)
-
-        # Phase 3.1: Span verification
-        def make_evidence(field_name: str) -> EvidenceRef | None:
-            span = evidence_spans.get(field_name)
-            if not span:
+                res = await asyncio.wait_for(self._llm.complete_json(spec),
+                                             timeout=max(5.0, _dtl()))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if attempt == 0 and type(exc).__name__ == "LLMUnavailableError" and _dtl() > 20:
+                    await asyncio.sleep(3)
+                    continue
+                logger.warning("auditor extract failed for %s: %r", c.canonical_url, exc)
                 return None
-            verification = verify_span(span, page_text)
-            if not verification.matched:
-                return None  # Span not found → no evidence
-            return EvidenceRef(
-                source="doc_page",
-                location=candidate.canonical_url,
-                span=span,
-                offset=verification.offset,
-                fetched_at=fetched_at,
-            )
+            item = _single_item(res.parsed)
+            logger.info("audit page %s → name=%r specific=%s listing=%s", c.canonical_url,
+                        (item or {}).get("name"), (item or {}).get("is_specific_opportunity"),
+                        (item or {}).get("is_listing_page"))
+            return item
+        return None
 
-        def make_field(field_name: str, raw_value: str | None) -> OpportunityField:
-            if not raw_value:
-                return OpportunityField(
-                    field_name=field_name,
-                    value="",
-                    evidence=None,
-                    status=FieldStatus.UNVERIFIED,
-                )
-            evidence = make_evidence(field_name)
-            return OpportunityField(
-                field_name=field_name,
-                value=raw_value,
-                evidence=evidence,
-                status=FieldStatus.EVIDENCED if evidence else FieldStatus.UNVERIFIED,
-            )
 
-        # Funding
+_TLD_COUNTRY = (
+    (".ac.uk", "United Kingdom"), (".gov.uk", "United Kingdom"), (".co.uk", "United Kingdom"),
+    (".edu.au", "Australia"), (".gov.au", "Australia"), (".edu.sg", "Singapore"),
+    (".gov.sg", "Singapore"), (".gc.ca", "Canada"), (".edu", "United States"),
+    (".de", "Germany"), (".ca", "Canada"), (".sg", "Singapore"), (".nl", "Netherlands"),
+    (".fr", "France"), (".se", "Sweden"), (".ie", "Ireland"), (".nz", "New Zealand"),
+    (".jp", "Japan"), (".kr", "South Korea"), (".au", "Australia"), (".uk", "United Kingdom"),
+)
+
+
+def _country_from_url(url: str) -> str:
+    """Host country implied by an institution's TLD; '' when ambiguous (.org/.com)."""
+    host = extract_domain(url)
+    return next((c for t, c in _TLD_COUNTRY if host.endswith(t)), "")
+
+
+def _target_levels(profile: Any) -> set[str]:
+    if profile is None:
+        return set()
+    return degree_levels_of(getattr(profile.preferences, "degree_level", "") or "")
+
+
+def _off_level(opp: Opportunity, target: set[str]) -> bool:
+    """True when the opportunity states degree levels and none match the target."""
+    if not target:
+        return False
+    stated: set[str] = set()
+    for lv in [*opp.degree_levels, *opp.eligibility.degree_levels]:
+        stated |= degree_levels_of(lv)
+    return bool(stated) and not (stated & target)
+
+
+def _single_item(parsed: Any) -> dict | None:
+    """Accept a bare object, the legacy {"pages": [...]} wrapper, or a list."""
+    if isinstance(parsed, dict) and isinstance(parsed.get("pages"), list):
+        parsed = parsed["pages"]
+    if isinstance(parsed, list):
+        parsed = next((x for x in parsed if isinstance(x, dict)), None)
+    return parsed if isinstance(parsed, dict) else None
+
+
+_KEY_LINE = re.compile(
+    r"deadline|eligib|require|gpa|ielts|toefl|pte|duolingo|nationality|citizen|resident|"
+    r"degree|who can apply|how to apply|criteria|master|bachelor|phd|doctoral|"
+    r"benefit|award|amount|stipend|covers?|tuition|allowance|per (month|year|annum)|"
+    r"open to|applicants? must|candidates? must|minimum|closing", re.I)
+
+
+def _excerpt(text: str) -> str:
+    """Title line + requirement/funding-dense lines in page order, ≤_EXCERPT chars."""
+    lines = [ln.strip() for ln in re.split(r"\n+", text or "") if ln.strip()]
+    if not lines:
+        return (text or "")[:_EXCERPT]
+    keep = lines[:1] + [ln for ln in lines[1:]
+                        if _FUNDING_RE.search(ln) or _KEY_LINE.search(ln)]
+    out = "\n".join(keep)
+    if len(out) < 600:                      # sparse page: fall back to the head
+        out = "\n".join(lines)
+    return out[:_EXCERPT]
+
+
+_GENERIC_NAMES = re.compile(
+    r"^(page|home|index|scholarships?|award|program|apply|admissions?|"
+    r"untitled|n/?a|none|unknown|title|search|login|main|welcome)$", re.I)
+
+
+def _sanitize_page(t: str) -> str:
+    """Fix mojibake but keep line structure (the excerpt and link parsing need it)."""
+    if not t:
+        return t or ""
+    t = re.sub(r"(?<=[A-Za-z])\ufffd(?=[a-z]|\s|s)", "\u2019", t).replace("\ufffd", " ")
+    t = re.sub(r"[ \t\f\v\r]+", " ", t)
+    return re.sub(r"\n\s*\n\s*", "\n\n", t).strip()
+
+
+def _d(v: Any) -> dict:
+    return v if isinstance(v, dict) else {}
+
+
+def _ls(v: Any) -> list[str]:
+    if isinstance(v, str):
+        return [v]
+    if isinstance(v, list):
+        return [str(x) for x in v if isinstance(x, (str, int, float))][:20]
+    return []
+
+
+def _clean_text(s: Any) -> str:
+    """Normalize mojibake: U+FFFD between letters → apostrophe, else space."""
+    if not isinstance(s, str):
+        s = str(s) if s else ""
+    if not s:
+        return s
+    s = re.sub(r"(?<=[A-Za-z])�(?=[a-z])", "’", s)
+    s = re.sub(r"(?<=[A-Za-z])�(?=\s|s)", "’", s)
+    s = s.replace("�", " ")
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _name_ok(name: str) -> bool:
+    return bool(name) and len(name) >= 4 and not _GENERIC_NAMES.match(name)
+
+
+def _build_opp(item: dict, cand: Candidate, page_text: str,
+               hints: dict | None = None) -> Opportunity | None:
+    name = _clean_text(item.get("name") or "")
+    if not _name_ok(name):
+        # Fall back to the page title (first line / <title>-like heading).
+        name = _clean_text((cand.title or "").split("–")[0].split("|")[0])
+    if not _name_ok(name):
+        return None
+    ev = _d(item.get("evidence"))
+    fields = []
+    for fn, key in (("name", "name"), ("deadline", "deadline"),
+                    ("funding", "funding"), ("eligibility", "eligibility")):
+        quote = ev.get(key) if isinstance(ev.get(key), str) else ""
+        status = FieldStatus.UNVERIFIED
+        ref = None
+        if quote:
+            vr = verify_span(quote, page_text)
+            if vr.matched and 15 <= len(quote) <= 400:
+                try:
+                    ref = EvidenceRef(source="web", location=cand.canonical_url,
+                                      span=quote[:400], offset=vr.offset)
+                    status = FieldStatus.EVIDENCED
+                except Exception:
+                    ref = None
+        fields.append(OpportunityField(field_name=fn, value=quote,
+                                       status=status, evidence=ref))
+    fund = _d(item.get("funding"))
+    raw_dl = item.get("deadline")
+    if isinstance(raw_dl, list):
+        raw_dl = raw_dl[0] if raw_dl else {}
+    dl = _d(raw_dl)
+    el = _d(item.get("eligibility"))
+    iso = (str(dl.get("iso_date") or "")[:10] or None)
+    is_past = None
+    if iso:
         try:
-            funding_level = FundingLevel(funding_level_str.upper())
-        except (ValueError, AttributeError):
-            funding_level = FundingLevel.UNKNOWN
-
-        funding_evidence = make_evidence("funding_level")
-        funding_details = funding_details_str or data.get("funding_level") or ""
-        funding_info = FundingInfo(
-            level=funding_level,
-            details=funding_details,
-            evidence=funding_evidence,
-            status=FieldStatus.EVIDENCED if funding_evidence else FieldStatus.UNVERIFIED,
-        )
-
-        # Deadline
-        deadline_raw = data.get("deadline")
-        deadline_evidence = make_evidence("deadline")
-        deadlines = []
-        if deadline_raw:
-            deadlines.append(DeadlineInfo(
-                date=deadline_raw,
-                description=deadline_raw,
-                as_of=fetched_at,
-                evidence=deadline_evidence,
-                status=FieldStatus.EVIDENCED if deadline_evidence else FieldStatus.UNVERIFIED,
-            ))
-
-        # Kind
-        kind_raw = data.get("kind", "PROGRAM")
+            is_past = date.fromisoformat(iso[:10]) < date.today()
+        except ValueError:
+            iso, is_past = None, None
+    if not _ls(item.get("host_countries")):
+        guess = _country_from_url(cand.canonical_url)
+        if guess:
+            item = {**item, "host_countries": [guess]}
+    specific = bool(item.get("is_specific_opportunity", True))
+    reachable = True
+    verified = reachable and specific and _name_in_page(name, page_text)
+    evd = sum(1 for f in fields if f.status == FieldStatus.EVIDENCED)
+    opp = Opportunity(
+        kind=_safe_kind(item.get("kind")),
+        name=name,
+        institution_or_funder=_clean_text(item.get("provider") or "") or cand.domain,
+        country=", ".join(_ls(item.get("host_countries"))),
+        host_countries=_ls(item.get("host_countries")),
+        degree_level=", ".join(_ls(item.get("degree_levels"))),
+        degree_levels=_ls(item.get("degree_levels")),
+        fields_of_study=_ls(item.get("fields_of_study")),
+        official_url=(str(item.get("application_url")) if isinstance(
+            item.get("application_url"), str) and item.get("application_url")
+            else cand.canonical_url),
+        application_url=str(item.get("application_url") or ""),
+        how_to_apply=str(item.get("how_to_apply") or ""),
+        selection_criteria=[str(x.get("criterion", x)) if isinstance(x, dict) else str(x)
+                            for x in (item.get("selection_criteria")
+                                      if isinstance(item.get("selection_criteria"), list)
+                                      else [])][:10],
+        fields=fields,
+        funding=FundingInfo(
+            details=str(fund.get("coverage") or ""),
+            amount=str(fund.get("amount_text")) if fund.get("amount_text") else None,
+            amount_value=(fund.get("amount_value") if isinstance(
+                fund.get("amount_value"), (int, float)) else None),
+            currency=str(fund.get("currency")) if fund.get("currency") else None,
+            period=str(fund.get("period")) if fund.get("period") else None,
+            covers=_ls(fund.get("covers")),
+        ),
+        deadlines=[DeadlineInfo(
+            date=str(dl.get("text")) if dl.get("text") else None,
+            iso_date=iso, is_past=is_past,
+            description=str(dl.get("text") or ""),
+        )] if (dl.get("text") or iso) else [],
+        eligibility=EligibilityCriteria(
+            nationalities=_ls(el.get("nationalities")),
+            nationality_text=str(el.get("nationality_text") or ""),
+            open_to_international=(el.get("open_to_international")
+                                   if isinstance(el.get("open_to_international"), bool)
+                                   else None),
+            degree_levels=_ls(el.get("degree_levels")),
+            fields_of_study=_ls(el.get("fields_of_study")),
+            min_gpa_value=(el.get("min_gpa_value") if isinstance(
+                el.get("min_gpa_value"), (int, float)) else None),
+            min_gpa_scale=(el.get("min_gpa_scale") if isinstance(
+                el.get("min_gpa_scale"), (int, float)) else None),
+            min_gpa_text=str(el.get("min_gpa_text") or ""),
+            language_requirements=[_lang_req(r) for r in
+                                   (el.get("language_requirements") or [])
+                                   if isinstance(r, dict) and r.get("test")],
+            min_work_experience_months=(el.get("min_work_experience_months")
+                if isinstance(el.get("min_work_experience_months"), (int, float))
+                else None),
+            max_age=(el.get("max_age") if isinstance(el.get("max_age"), (int, float))
+                     else None),
+            other=[str(x) for x in (el.get("other") or [])],
+        ),
+        verification=VerificationResult(
+            reachable=reachable, trust_tier=cand.trust_tier,
+            existence_verified=verified,
+            completeness_score=round(evd / 4.0, 2), evidenced_fields=evd,
+            failure_notes=[] if verified else ["name or specifics not evidenced"],
+        ),
+        origin=cand.origin,
+    )
+    if hints:
         try:
-            kind = OpportunityKind(kind_raw)
-        except (ValueError, AttributeError):
-            kind = candidate.kind_hint or OpportunityKind.PROGRAM
+            _apply_hints(opp, hints, page_text, cand.canonical_url)
+        except Exception as exc:
+            logger.debug("hint fill skipped for %s: %r", cand.canonical_url, exc)
+    return opp
 
-        # Verification result
-        name_evidenced = make_evidence("name") is not None
-        verification = VerificationResult(
-            reachable=True,
-            trust_tier=candidate.trust_tier,
-            existence_verified=name_evidenced,
-            completeness_score=self._completeness_score(data),
-            failure_notes=[],
-        )
 
-        return Opportunity(
-            id=str(uuid.uuid4()),
-            kind=kind,
-            name=name,
-            institution_or_funder=data.get("institution_or_funder") or "",
-            country=data.get("country") or "",
-            degree_level=data.get("degree_level") or "",
-            official_url=candidate.canonical_url,
-            fields=[
-                make_field("name", name),
-                make_field("institution_or_funder", data.get("institution_or_funder")),
-                make_field("country", data.get("country")),
-                make_field("degree_level", data.get("degree_level")),
-            ],
-            funding=funding_info,
-            deadlines=deadlines,
-            requirements=[
-                OpportunityField(
-                    field_name="requirement",
-                    value=r,
-                    evidence=None,
-                    status=FieldStatus.UNVERIFIED,
-                )
-                for r in (data.get("requirements") or []) + (data.get("eligibility") or [])
-            ],
-            verification=verification,
-        )
+_TEST_NAMES = {"ielts": "IELTS", "toefl": "TOEFL", "pte": "PTE", "duolingo": "Duolingo"}
 
-    @staticmethod
-    def _completeness_score(data: dict) -> float:
-        """Simple heuristic completeness based on non-null fields."""
-        fields = ["name", "institution_or_funder", "country", "degree_level", "funding_level", "deadline", "eligibility"]
-        present = sum(1 for f in fields if data.get(f))
-        return present / len(fields)
+
+def _apply_hints(opp: Opportunity, hints: dict, page_text: str, url: str) -> None:
+    """Fill requirements the LLM omitted from regex hints whose source sentence
+    is verifiably on the page; that sentence becomes the evidence."""
+    def ok(h: dict | None) -> bool:
+        return isinstance(h, dict) and bool(h.get("sentence")) and verify_span(
+            h["sentence"], page_text).matched
+
+    el = opp.eligibility
+    used: list[str] = []
+    if not el.language_requirements:
+        for key, test in _TEST_NAMES.items():
+            h = hints.get(key)
+            if ok(h):
+                el.language_requirements.append(LanguageRequirement(
+                    test=test, min_score=float(h["groups"][0]), text=h["sentence"]))
+                used.append(h["sentence"])
+    if el.min_gpa_value is None:
+        h, pct = hints.get("gpa"), hints.get("gpa_pct")
+        if ok(h):
+            el.min_gpa_value, el.min_gpa_scale = float(h["groups"][0]), float(h["groups"][1])
+            el.min_gpa_text = h["sentence"]
+            used.append(h["sentence"])
+        elif ok(pct):
+            el.min_gpa_value, el.min_gpa_scale = float(pct["groups"][0]), 100.0
+            el.min_gpa_text = pct["sentence"]
+            used.append(pct["sentence"])
+    if not opp.deadlines and ok(hints.get("deadline")):
+        h = hints["deadline"]
+        try:
+            from dateutil import parser as dparser
+            d = dparser.parse(h["groups"][0], fuzzy=True).date()
+            opp.deadlines.append(DeadlineInfo(date=h["groups"][0], iso_date=d.isoformat(),
+                                              is_past=d < date.today(), description=h["sentence"]))
+            used.append(h["sentence"])
+        except (ValueError, OverflowError):
+            pass
+    for f in opp.fields:
+        if not used:
+            break
+        if f.status != FieldStatus.EVIDENCED and f.field_name in ("eligibility", "deadline"):
+            quote = used[0][:400]
+            vr = verify_span(quote, page_text)
+            if vr.matched:
+                f.value, f.status = quote, FieldStatus.EVIDENCED
+                f.evidence = EvidenceRef(source="web", location=url, span=quote, offset=vr.offset)
+    opp.verification.evidenced_fields = sum(
+        1 for f in opp.fields if f.status == FieldStatus.EVIDENCED)
+    opp.verification.completeness_score = round(opp.verification.evidenced_fields / 4.0, 2)
+
+
+def _lang_req(r: dict) -> LanguageRequirement:
+    try:
+        score = r.get("min_score")
+        return LanguageRequirement(test=str(r["test"]),
+                                   min_score=float(score) if score is not None else 0.0,
+                                   text=str(r.get("text") or ""))
+    except Exception:
+        return LanguageRequirement(test=str(r.get("test", "?")), min_score=0.0)
+
+
+def _safe_kind(raw: Any):
+    from scholarship_finder.domain.models import OpportunityKind
+    try:
+        return OpportunityKind(str(raw or "").lower())
+    except (ValueError, TypeError):
+        return OpportunityKind.SCHOLARSHIP
+
+
+_NAME_STOP = frozenset({"the", "a", "an", "of", "for", "in", "and", "to",
+                        "scholarship", "scholarships", "award", "program",
+                        "programme", "fund", "fellowship", "grant", "international",
+                        "students", "student", "fully", "funded"})
+
+
+def _name_in_page(name: str, page_text: str) -> bool:
+    """≥60% of distinctive name tokens appear on the page (stop-words/years out)."""
+    toks = [t for t in re.findall(r"[A-Za-z]{3,}", name.lower())
+            if t not in _NAME_STOP and not t.isdigit()]
+    if not toks:
+        return _norm(name)[:20] in _norm(page_text)
+    page = _norm(page_text)
+    hit = sum(1 for t in toks if t in page)
+    return hit / len(toks) >= 0.6
+
+
+from scholarship_finder.domain.source_filters import is_junk_url
+
+
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").lower()).strip()
+
+
+def _norm_name(s: str) -> str:
+    s = _norm(s)
+    s = re.sub(r"(19|20)\d{2}.*$", "", s)           # strip year onwards
+    s = re.sub(r"(scholarships?|awards?|programs?|fellowships?|scheme|"
+               r"application|apply|for international students|fully funded)",
+               "", s)
+    s = re.sub(r"(1st|2nd|3rd|first|second|third)", "", s)
+    return re.sub(r"\s+", " ", s).strip()[:60]
+
+
+def _is_dup(o: Opportunity, existing: list[Opportunity]) -> bool:
+    nk = (_norm_name(o.name), _norm(o.institution_or_funder))
+    for e in existing:
+        if (_norm_name(e.name), _norm(e.institution_or_funder)) == nk or (
+                _norm_name(e.name) and _norm_name(e.name) == _norm_name(o.name)):
+            return True
+        if e.official_url and o.official_url and e.official_url == o.official_url:
+            return True
+    return False
+
+
+def _dedupe(opps: list[Opportunity]) -> list[Opportunity]:
+    out: list[Opportunity] = []
+    for o in opps:
+        if not _is_dup(o, out):
+            out.append(o)
+        else:
+            for i, e in enumerate(out):
+                if ((_norm(e.name), _norm(e.institution_or_funder)) ==
+                    (_norm(o.name), _norm(o.institution_or_funder)) or
+                        (e.official_url and e.official_url == o.official_url)):
+                    if o.trust_tier.value > e.trust_tier.value:
+                        out[i] = o
+                    break
+    return out
+
+
+def _dedupe_leads(leads: list[Lead]) -> list[Lead]:
+    seen, out = set(), []
+    for l in leads:
+        k = _norm(l.name)
+        if k and k not in seen:
+            seen.add(k); out.append(l)
+    return out
+
+
+def _target() -> int:
+    try:
+        from scholarship_finder.config import get_settings
+        return get_settings().target_verified_opportunities
+    except Exception:
+        return 10

@@ -14,7 +14,7 @@ pip install -e ".[dev]"
 
 # 2. Configure API keys
 cp .env.example .env
-# Edit .env — add GEMINI_API_KEY + TAVILY_API_KEY at minimum
+# Edit .env — add JINA_API_KEY plus GROQ_API_KEY or GEMINI_API_KEY (or run the local llama.cpp model)
 
 # 3. Pre-flight check (optional)
 python -m scholarship_finder.preflight
@@ -134,16 +134,21 @@ graph TB
 ## Environment Variables
 
 ```env
-# Core (required for live mode)
-GEMINI_API_KEY=...          # Google AI Studio key
-TAVILY_API_KEY=...          # Tavily search
+# LLM (at least one of these, or a running local llama.cpp server)
+GROQ_API_KEY=...            # primary cloud text model
+GEMINI_API_KEY=...          # backup text + vision (OCR)
 
-# Optional enrichment
-OPENAI_API_KEY=...          # OpenAI-compatible fallback LLM
-OPENAI_API_BASE_URL=...
-JINA_API_KEY=...            # Jina secondary search / reader
-SERPER_API_KEY=...          # Alternative secondary search
+# Search: Jina is enough; Tavily is optional and is disabled automatically
+# for 30 minutes if its key is invalid or its plan limit is hit.
+JINA_API_KEY=...            # Jina Search + Reader (free key)
+TAVILY_API_KEY=...          # optional
+SERPER_API_KEY=...          # alternative secondary search
 GITHUB_TOKEN=...            # GitHub profile enrichment
+
+# Local model (llama.cpp) - see AGENTS.md
+LOCAL_LLM_AUTOSTART=true
+LOCAL_LLM_SERVER_PATH=C:\llama-cpp-cuda\llama-server.exe
+LOCAL_LLM_MODEL_PATH=C:\models\Qwen2.5-7B-Instruct-Q4_K_M.gguf
 
 # LLM tier chains (model IDs never in code)
 TIER_FAST_CHAIN=gemini-3.5-flash-lite,gemini-3.6-flash

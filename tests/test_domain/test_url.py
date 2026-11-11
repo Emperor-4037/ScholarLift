@@ -1,7 +1,6 @@
 """Tests for URL canonicalization and SSRF protection."""
 from __future__ import annotations
 
-import pytest
 
 from scholarship_finder.domain.url import (
     canonicalize_url,

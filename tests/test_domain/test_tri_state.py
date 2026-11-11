@@ -1,7 +1,6 @@
 """Tests for the tri-state eligibility rule evaluator."""
 from __future__ import annotations
 
-import pytest
 
 from scholarship_finder.domain.models import EligibilityResult
 from scholarship_finder.domain.tri_state import (

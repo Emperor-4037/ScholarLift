@@ -24,6 +24,7 @@ Usage
 from __future__ import annotations
 
 import logging
+import asyncio
 import threading
 from collections import deque
 from typing import Final
@@ -38,7 +39,6 @@ _RING_CAPACITY: Final[int] = 500
 _TERMINAL_KINDS: Final[frozenset[EventKind]] = frozenset({
     EventKind.RUN_COMPLETED,
     EventKind.RUN_DEGRADED,
-    EventKind.PHASE_A_READY,
 })
 
 
@@ -57,6 +57,10 @@ class EventBus:
         self._terminal: Event | None = None   # protected terminal slot
         self._lock = threading.Lock()          # thread-safe (not asyncio.Lock)
         self._seq = 0                          # monotonic sequence counter
+        # Push-based SSE notification: waiters live on other threads' event
+        # loops, so each is stored with its loop and woken thread-safely.
+        self._waiters: set[tuple[asyncio.AbstractEventLoop, asyncio.Event]] = set()
+        self._waiter_lock = threading.Lock()   # guards _waiters mutations
 
     # ── Publishing ────────────────────────────────────────────────────────────
 
@@ -88,6 +92,8 @@ class EventBus:
                 "EventBus publish seq=%d kind=%s node=%s",
                 stamped.seq, stamped.kind, stamped.node,
             )
+        # Wake push-based SSE waiters (Phase 3D)
+        self._wake_waiters()
 
     def publish_sync(self, event: Event) -> None:
         """Synchronous publish — callable from any thread, any async context.
@@ -108,6 +114,8 @@ class EventBus:
             if stamped.kind in _TERMINAL_KINDS:
                 self._terminal = stamped
             self._ring.append(stamped)
+        # Wake push-based SSE waiters (Phase 3D)
+        self._wake_waiters()
 
     # ── Subscribing ───────────────────────────────────────────────────────────
 
@@ -153,6 +161,40 @@ class EventBus:
     def event_count(self) -> int:
         with self._lock:
             return len(self._ring)
+
+    # ── Push-based async notification (Phase 3D) ────────────────────────────────
+
+    def _wake_waiters(self) -> None:
+        """Signal all waiters that new events are available.
+
+        Thread-safe: each asyncio.Event belongs to a different thread's loop,
+        so we must set it via ``loop.call_soon_threadsafe`` — calling
+        ``ev.set()`` directly from the publisher's thread is not safe.
+        """
+        with self._waiter_lock:
+            for loop, ev in list(self._waiters):
+                try:
+                    loop.call_soon_threadsafe(ev.set)
+                except RuntimeError:
+                    pass  # loop already closed — waiter gone
+
+    async def wait_for_new_events(self, timeout: float = 10.0) -> None:
+        """Wait until a new event is published or timeout expires.
+
+        Returns when any new event is published or after *timeout* seconds.
+        """
+        loop = asyncio.get_running_loop()
+        waiter = asyncio.Event()
+        entry = (loop, waiter)
+        with self._waiter_lock:
+            self._waiters.add(entry)
+        try:
+            await asyncio.wait_for(waiter.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            pass  # timeout is fine; caller re-polls
+        finally:
+            with self._waiter_lock:
+                self._waiters.discard(entry)
 
     # ── SSE Support (non-breaking addition) ───────────────────────────────────
 
