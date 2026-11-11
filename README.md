@@ -210,7 +210,8 @@ ScholarShip_Finder/
 │   └── test_phase3/     # End-to-end smoke tests
 ├── pyproject.toml
 ├── .env.example
-└── ARCHITECTURE.md      # Detailed system architecture diagrams
+├── Full_Architecture.png     # System architecture diagram
+└── Hexagonal_Architecture.png # Hexagonal layers diagram
 ```
 
 ---
